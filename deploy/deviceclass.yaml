@@ -6,3 +6,19 @@ spec:
   selectors:
   - cel:
       expression: "device.driver == \"dra.nvme\""
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dra.nvme-vfio
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == \"dra.nvme\""
+  config:
+  - opaque:
+      driver: dra.nvme
+      parameters:
+        apiVersion: nvme.dra.io/v1alpha1
+        kind: NvmeConfig
+        mode: vfio

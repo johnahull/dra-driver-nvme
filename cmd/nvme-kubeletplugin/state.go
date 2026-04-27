@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
+	nvmeapi "github.com/johnahull/dra-driver-nvme/api"
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 
@@ -30,6 +33,13 @@ type DeviceState struct {
 
 type PreparedNvme struct {
 	drapbv1.Device
+	IsVFIO     bool
+	PCIAddress string
+}
+
+type OpaqueDeviceConfig struct {
+	Requests []string
+	Config   runtime.Object
 }
 
 func NewDeviceState(f *flags) (*DeviceState, error) {
@@ -65,45 +75,116 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 		return nil, fmt.Errorf("claim not yet allocated")
 	}
 
-	// Collect all CDI devices for this claim into one spec
-	var cdiDevices []cdispec.Device
-	var prepared []PreparedNvme
+	// Parse opaque configs to determine mode (block vs vfio)
+	configs, err := getOpaqueDeviceConfigs(claim.Status.Allocation.Devices.Config)
+	if err != nil {
+		return nil, fmt.Errorf("error getting device configs: %w", err)
+	}
+
+	// Add default config at lowest precedence
+	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{
+		Requests: []string{},
+		Config:   nvmeapi.DefaultNvmeConfig(),
+	})
+
+	// Map each allocation result to its config
+	type deviceWithConfig struct {
+		result *resourceapi.DeviceRequestAllocationResult
+		config *nvmeapi.NvmeConfig
+	}
+	var devicesWithConfig []deviceWithConfig
 
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		// Skip devices from other drivers in multi-driver claims
 		if result.Driver != DriverName {
 			continue
 		}
-
-		allocDev, exists := s.allocatable[result.Device]
-		if !exists {
+		if _, exists := s.allocatable[result.Device]; !exists {
 			return nil, fmt.Errorf("NVMe device not found: %s", result.Device)
 		}
 
-		// Build CDI container edits with block device paths
-		var deviceNodes []*cdispec.DeviceNode
-		// Controller character device
-		ctrlPath := fmt.Sprintf("/dev/%s", allocDev.Info.Controller)
-		deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
-			Path:     ctrlPath,
-			HostPath: ctrlPath,
-			Type:     "c",
+		// Find matching config (last match wins)
+		var matchedConfig *nvmeapi.NvmeConfig
+		for _, c := range slices.Backward(configs) {
+			if len(c.Requests) == 0 || slices.Contains(c.Requests, result.Request) {
+				cfg, ok := c.Config.(*nvmeapi.NvmeConfig)
+				if ok {
+					matchedConfig = cfg
+					break
+				}
+			}
+		}
+		if matchedConfig == nil {
+			matchedConfig = nvmeapi.DefaultNvmeConfig()
+		}
+
+		if err := matchedConfig.Normalize(); err != nil {
+			return nil, fmt.Errorf("error normalizing config for %s: %w", result.Device, err)
+		}
+		if err := matchedConfig.Validate(); err != nil {
+			return nil, fmt.Errorf("error validating config for %s: %w", result.Device, err)
+		}
+
+		resultCopy := result
+		devicesWithConfig = append(devicesWithConfig, deviceWithConfig{
+			result: &resultCopy,
+			config: matchedConfig,
 		})
-		// Namespace block devices
-		for _, ns := range allocDev.Info.Namespaces {
+	}
+
+	// Prepare each device according to its config.
+	// Track VFIO-bound devices for rollback on partial failure.
+	var cdiDevices []cdispec.Device
+	var prepared []PreparedNvme
+	var vfioBound []string // PCI addresses bound to vfio-pci so far
+
+	for _, dwc := range devicesWithConfig {
+		result := dwc.result
+		allocDev := s.allocatable[result.Device]
+
+		var deviceNodes []*cdispec.DeviceNode
+		isVFIO := dwc.config.Mode == "vfio"
+
+		if isVFIO {
+			// VFIO mode: bind to vfio-pci
+			iommuGroup, err := s.prepareVFIO(allocDev.Info.PCIAddress)
+			if err != nil {
+				// Rollback any VFIO bindings done so far
+				for _, addr := range vfioBound {
+					s.unprepareVFIO(addr)
+				}
+				return nil, fmt.Errorf("VFIO prepare failed for %s: %w", result.Device, err)
+			}
+			vfioBound = append(vfioBound, allocDev.Info.PCIAddress)
+
+			vfioDevPath := fmt.Sprintf("/dev/vfio/%s", iommuGroup)
+			deviceNodes = []*cdispec.DeviceNode{
+				{Path: "/dev/vfio/vfio", HostPath: "/dev/vfio/vfio", Type: "c"},
+				{Path: vfioDevPath, HostPath: vfioDevPath, Type: "c"},
+			}
+
+			klog.Infof("Prepared NVMe %s (VFIO) for claim %s: PCI=%s IOMMU=%s",
+				result.Device, claimUID, allocDev.Info.PCIAddress, iommuGroup)
+		} else {
+			// Block mode: expose /dev/nvme* devices
+			ctrlPath := fmt.Sprintf("/dev/%s", allocDev.Info.Controller)
 			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
-				Path:     ns.DevicePath,
-				HostPath: ns.DevicePath,
-				Type:     "b",
+				Path: ctrlPath, HostPath: ctrlPath, Type: "c",
 			})
+			for _, ns := range allocDev.Info.Namespaces {
+				deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+					Path: ns.DevicePath, HostPath: ns.DevicePath, Type: "b",
+				})
+			}
+
+			klog.Infof("Prepared NVMe %s (block) for claim %s: PCI=%s namespaces=%d",
+				result.Device, claimUID, allocDev.Info.PCIAddress, len(allocDev.Info.Namespaces))
 		}
 
 		cdiDeviceName := fmt.Sprintf("%s-%s", claimUID, result.Device)
 		cdiDevices = append(cdiDevices, cdispec.Device{
-			Name: cdiDeviceName,
-			ContainerEdits: cdispec.ContainerEdits{
-				DeviceNodes: deviceNodes,
-			},
+			Name:           cdiDeviceName,
+			ContainerEdits: cdispec.ContainerEdits{DeviceNodes: deviceNodes},
 		})
 
 		cdiDeviceID := cdiparser.QualifiedName(cdiVendor, cdiClass, cdiDeviceName)
@@ -114,10 +195,9 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 				DeviceName:   result.Device,
 				CdiDeviceIds: []string{cdiDeviceID},
 			},
+			IsVFIO:     isVFIO,
+			PCIAddress: allocDev.Info.PCIAddress,
 		})
-
-		klog.Infof("Prepared NVMe %s for claim %s: PCI=%s, namespaces=%d",
-			result.Device, claimUID, allocDev.Info.PCIAddress, len(allocDev.Info.Namespaces))
 	}
 
 	// Write one CDI spec per claim containing all devices
@@ -146,8 +226,16 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 	s.Lock()
 	defer s.Unlock()
 
-	if _, ok := s.prepared[claimUID]; !ok {
+	devices, ok := s.prepared[claimUID]
+	if !ok {
 		return nil
+	}
+
+	// Rebind any VFIO devices back to nvme
+	for _, dev := range devices {
+		if dev.IsVFIO && dev.PCIAddress != "" {
+			s.unprepareVFIO(dev.PCIAddress)
+		}
 	}
 
 	// Remove CDI spec
@@ -161,8 +249,8 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 	return nil
 }
 
-// PrepareVFIO binds an NVMe device to vfio-pci for VM passthrough.
-func (s *DeviceState) PrepareVFIO(pciAddr string) (string, error) {
+// prepareVFIO binds an NVMe device to vfio-pci and returns the IOMMU group.
+func (s *DeviceState) prepareVFIO(pciAddr string) (string, error) {
 	// Unbind from current driver
 	driverPath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)
 	if target, err := os.Readlink(driverPath); err == nil {
@@ -203,8 +291,8 @@ func (s *DeviceState) PrepareVFIO(pciAddr string) (string, error) {
 	return iommuGroup, nil
 }
 
-// UnprepareVFIO rebinds an NVMe device from vfio-pci back to the nvme driver.
-func (s *DeviceState) UnprepareVFIO(pciAddr string) {
+// unprepareVFIO rebinds an NVMe device from vfio-pci back to the nvme driver.
+func (s *DeviceState) unprepareVFIO(pciAddr string) {
 	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
 	if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
 		klog.Warningf("Failed to unbind %s from vfio-pci: %v", pciAddr, err)
@@ -214,4 +302,26 @@ func (s *DeviceState) UnprepareVFIO(pciAddr string) {
 	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
 		klog.Warningf("Failed to rebind %s to nvme: %v", pciAddr, err)
 	}
+}
+
+// getOpaqueDeviceConfigs extracts NvmeConfig objects from the claim's allocation configs.
+func getOpaqueDeviceConfigs(configs []resourceapi.DeviceAllocationConfiguration) ([]*OpaqueDeviceConfig, error) {
+	var result []*OpaqueDeviceConfig
+	for _, config := range configs {
+		if config.DeviceConfiguration.Opaque == nil {
+			continue
+		}
+		if config.DeviceConfiguration.Opaque.Driver != DriverName {
+			continue
+		}
+		decoded, err := runtime.Decode(nvmeapi.Decoder, config.DeviceConfiguration.Opaque.Parameters.Raw)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding NvmeConfig: %w", err)
+		}
+		result = append(result, &OpaqueDeviceConfig{
+			Requests: config.Requests,
+			Config:   decoded,
+		})
+	}
+	return result, nil
 }
