@@ -13,10 +13,14 @@ func (d *AllocatableDevice) GetDevice(name string) resourceapi.Device {
 		"dra.nvme/serial":      {StringValue: ptr.To(d.Info.Serial)},
 		"dra.nvme/firmwareRev": {StringValue: ptr.To(d.Info.FirmwareRev)},
 		"dra.nvme/transport":   {StringValue: ptr.To(d.Info.Transport)},
-		"dra.nvme/numaNode":    {IntValue: ptr.To(int64(d.Info.NUMANode))},
+		// Vendor-specific NUMA
+		"dra.nvme/numaNode": {IntValue: ptr.To(int64(d.Info.NUMANode))},
+		// Standardized topology attributes for cross-driver matchAttribute
+		"resource.kubernetes.io/numaNode":    {IntValue: ptr.To(int64(d.Info.NUMANode))},
+		"resource.kubernetes.io/cpuSocketID": {IntValue: ptr.To(int64(d.Info.CPUSocketID))},
 	}
 
-	// Standard topology attributes
+	// Standard PCI topology attributes from deviceattribute library
 	if d.pciBusIDAttr.Name != "" {
 		attrs[d.pciBusIDAttr.Name] = d.pciBusIDAttr.Value
 	}
