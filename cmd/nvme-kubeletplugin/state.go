@@ -209,11 +209,17 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 		}
 		minVersion, err := cdiapi.MinimumRequiredVersion(spec)
 		if err != nil {
+			for _, addr := range vfioBound {
+				s.unprepareVFIO(addr)
+			}
 			return nil, fmt.Errorf("failed to get CDI spec version: %w", err)
 		}
 		spec.Version = minVersion
 
 		if err := s.cdiCache.WriteSpec(spec, specName); err != nil {
+			for _, addr := range vfioBound {
+				s.unprepareVFIO(addr)
+			}
 			return nil, fmt.Errorf("failed to write CDI spec: %w", err)
 		}
 	}
@@ -305,8 +311,9 @@ func (s *DeviceState) unprepareVFIO(pciAddr string) {
 }
 
 // getOpaqueDeviceConfigs extracts NvmeConfig objects from the claim's allocation configs.
+// Returns configs in order of precedence (lowest first): class configs, then claim configs.
 func getOpaqueDeviceConfigs(configs []resourceapi.DeviceAllocationConfiguration) ([]*OpaqueDeviceConfig, error) {
-	var result []*OpaqueDeviceConfig
+	var classConfigs, claimConfigs []*OpaqueDeviceConfig
 	for _, config := range configs {
 		if config.DeviceConfiguration.Opaque == nil {
 			continue
@@ -318,10 +325,17 @@ func getOpaqueDeviceConfigs(configs []resourceapi.DeviceAllocationConfiguration)
 		if err != nil {
 			return nil, fmt.Errorf("error decoding NvmeConfig: %w", err)
 		}
-		result = append(result, &OpaqueDeviceConfig{
+		odc := &OpaqueDeviceConfig{
 			Requests: config.Requests,
 			Config:   decoded,
-		})
+		}
+		switch config.Source {
+		case resourceapi.AllocationConfigSourceClass:
+			classConfigs = append(classConfigs, odc)
+		case resourceapi.AllocationConfigSourceClaim:
+			claimConfigs = append(claimConfigs, odc)
+		}
 	}
-	return result, nil
+	// Class configs first (lowest precedence), then claim configs (highest)
+	return append(classConfigs, claimConfigs...), nil
 }

@@ -124,9 +124,13 @@ func Discover() ([]DeviceInfo, error) {
 }
 
 func isPCIAddress(s string) bool {
-	// PCI address format: DDDD:BB:DD.F
+	// PCI address format: DDDD:BB:DD.F (e.g., 0000:3b:00.0)
 	parts := strings.Split(s, ":")
-	return len(parts) == 3
+	if len(parts) != 3 {
+		return false
+	}
+	// Last segment must contain a dot (DD.F)
+	return strings.Contains(parts[2], ".")
 }
 
 func readStringFile(path string) string {
