@@ -3,19 +3,19 @@ package main
 import (
 	"context"
 	"fmt"
-	"maps"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
+	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
 	"k8s.io/klog/v2"
 )
 
 type driver struct {
-	helper      *kubeletplugin.Helper
-	state       *DeviceState
+	helper *kubeletplugin.Helper
+	state  *DeviceState
 }
 
 func NewDriver(ctx context.Context, clientset kubernetes.Interface, f *flags) (*driver, error) {
@@ -35,16 +35,19 @@ func NewDriver(ctx context.Context, clientset kubernetes.Interface, f *flags) (*
 		kubeletplugin.DriverName(DriverName),
 		kubeletplugin.RegistrarDirectoryPath(f.kubeletRegistrarDirectoryPath),
 		kubeletplugin.PluginDataDirectoryPath(f.pluginDataDirectoryPath),
+		kubeletplugin.EnableDeviceMetadata(true),
+		kubeletplugin.MetadataVersions(drametadatav1alpha1.SchemeGroupVersion),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error starting kubelet plugin: %w", err)
 	}
 	d.helper = helper
 
-	// Build resource list from discovered devices
-	devices := make([]resourceapi.Device, 0, len(state.allocatable))
-	for name, dev := range maps.All(state.allocatable) {
-		devices = append(devices, dev.GetDevice(name))
+	// Build resource list in deterministic order
+	sortedNames := state.allocatable.SortedNames()
+	devices := make([]resourceapi.Device, 0, len(sortedNames))
+	for _, name := range sortedNames {
+		devices = append(devices, state.allocatable[name].GetDevice(name))
 	}
 
 	resources := resourceslice.DriverResources{
@@ -105,8 +108,8 @@ func (d *driver) prepareClaim(claim *resourceapi.ResourceClaim) kubeletplugin.Pr
 			dev.Metadata = &kubeletplugin.DeviceMetadata{
 				Attributes: map[string]resourceapi.DeviceAttribute{
 					"resource.kubernetes.io/pciBusID": {StringValue: &pci},
-					"numaNode":                        {IntValue: &numa},
-					"model":                           {StringValue: &model},
+					"numaNode":                       {IntValue: &numa},
+					"model":                          {StringValue: &model},
 				},
 			}
 		}

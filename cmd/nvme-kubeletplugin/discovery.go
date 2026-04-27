@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/johnahull/dra-driver-nvme/pkg/nvme"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
@@ -18,6 +19,16 @@ type AllocatableDevice struct {
 // AllocatableDevices maps canonical device names to their allocatable device info.
 type AllocatableDevices map[string]*AllocatableDevice
 
+// SortedNames returns device names in sorted order for deterministic ResourceSlice publication.
+func (d AllocatableDevices) SortedNames() []string {
+	names := make([]string, 0, len(d))
+	for name := range d {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func enumerateDevices() (AllocatableDevices, error) {
 	nvmeDevices, err := nvme.Discover()
 	if err != nil {
@@ -25,7 +36,7 @@ func enumerateDevices() (AllocatableDevices, error) {
 	}
 
 	devices := make(AllocatableDevices)
-	for i, dev := range nvmeDevices {
+	for _, dev := range nvmeDevices {
 		pciBusIDAttr, err := deviceattribute.GetPCIBusIDAttribute(dev.PCIAddress)
 		if err != nil {
 			klog.Warningf("Failed to get PCI Bus ID attribute for %s: %v", dev.Controller, err)
@@ -38,14 +49,15 @@ func enumerateDevices() (AllocatableDevices, error) {
 			continue
 		}
 
-		name := fmt.Sprintf("nvme-%d", i)
+		// Use controller name as device name for stable identity across restarts
+		name := dev.Controller
 		devices[name] = &AllocatableDevice{
 			Info:         dev,
 			pciBusIDAttr: pciBusIDAttr,
 			pcieRootAttr: pcieRootAttr,
 		}
-		klog.Infof("Registered device %s: PCI=%s NUMA=%d model=%s",
-			name, dev.PCIAddress, dev.NUMANode, dev.Model)
+		klog.Infof("Registered device %s: PCI=%s NUMA=%d socket=%d model=%s",
+			name, dev.PCIAddress, dev.NUMANode, dev.CPUSocketID, dev.Model)
 	}
 
 	klog.Infof("Discovered %d NVMe devices", len(devices))

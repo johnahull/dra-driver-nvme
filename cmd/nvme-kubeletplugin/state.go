@@ -26,7 +26,6 @@ type DeviceState struct {
 	allocatable AllocatableDevices
 	prepared    map[string][]PreparedNvme // claimUID -> prepared devices
 	cdiCache    *cdiapi.Cache
-	cdiRoot     string
 }
 
 type PreparedNvme struct {
@@ -48,7 +47,6 @@ func NewDeviceState(f *flags) (*DeviceState, error) {
 		allocatable: allocatable,
 		prepared:    make(map[string][]PreparedNvme),
 		cdiCache:    cache,
-		cdiRoot:     f.cdiRoot,
 	}, nil
 }
 
@@ -67,9 +65,12 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 		return nil, fmt.Errorf("claim not yet allocated")
 	}
 
+	// Collect all CDI devices for this claim into one spec
+	var cdiDevices []cdispec.Device
 	var prepared []PreparedNvme
+
 	for _, result := range claim.Status.Allocation.Devices.Results {
-		// Skip devices from other drivers
+		// Skip devices from other drivers in multi-driver claims
 		if result.Driver != DriverName {
 			continue
 		}
@@ -97,32 +98,15 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 			})
 		}
 
-		// Write CDI spec for this claim+device
-		specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 		cdiDeviceName := fmt.Sprintf("%s-%s", claimUID, result.Device)
-		spec := &cdispec.Spec{
-			Kind: cdiKind,
-			Devices: []cdispec.Device{
-				{
-					Name: cdiDeviceName,
-					ContainerEdits: cdispec.ContainerEdits{
-						DeviceNodes: deviceNodes,
-					},
-				},
+		cdiDevices = append(cdiDevices, cdispec.Device{
+			Name: cdiDeviceName,
+			ContainerEdits: cdispec.ContainerEdits{
+				DeviceNodes: deviceNodes,
 			},
-		}
-		minVersion, err := cdiapi.MinimumRequiredVersion(spec)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get CDI spec version: %w", err)
-		}
-		spec.Version = minVersion
-
-		if err := s.cdiCache.WriteSpec(spec, specName); err != nil {
-			return nil, fmt.Errorf("failed to write CDI spec: %w", err)
-		}
+		})
 
 		cdiDeviceID := cdiparser.QualifiedName(cdiVendor, cdiClass, cdiDeviceName)
-
 		prepared = append(prepared, PreparedNvme{
 			Device: drapbv1.Device{
 				RequestNames: []string{result.Request},
@@ -134,6 +118,24 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 
 		klog.Infof("Prepared NVMe %s for claim %s: PCI=%s, namespaces=%d",
 			result.Device, claimUID, allocDev.Info.PCIAddress, len(allocDev.Info.Namespaces))
+	}
+
+	// Write one CDI spec per claim containing all devices
+	if len(cdiDevices) > 0 {
+		specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
+		spec := &cdispec.Spec{
+			Kind:    cdiKind,
+			Devices: cdiDevices,
+		}
+		minVersion, err := cdiapi.MinimumRequiredVersion(spec)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get CDI spec version: %w", err)
+		}
+		spec.Version = minVersion
+
+		if err := s.cdiCache.WriteSpec(spec, specName); err != nil {
+			return nil, fmt.Errorf("failed to write CDI spec: %w", err)
+		}
 	}
 
 	s.prepared[claimUID] = prepared
@@ -161,7 +163,7 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 
 // PrepareVFIO binds an NVMe device to vfio-pci for VM passthrough.
 func (s *DeviceState) PrepareVFIO(pciAddr string) (string, error) {
-	// Unbind from nvme driver
+	// Unbind from current driver
 	driverPath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)
 	if target, err := os.Readlink(driverPath); err == nil {
 		currentDriver := filepath.Base(target)
@@ -185,7 +187,9 @@ func (s *DeviceState) PrepareVFIO(pciAddr string) (string, error) {
 	}
 
 	// Clear driver_override
-	os.WriteFile(overridePath, []byte(""), 0644)
+	if err := os.WriteFile(overridePath, []byte(""), 0644); err != nil {
+		klog.Warningf("Failed to clear driver_override for %s: %v", pciAddr, err)
+	}
 
 	// Get IOMMU group
 	iommuLink := fmt.Sprintf("/sys/bus/pci/devices/%s/iommu_group", pciAddr)
@@ -202,7 +206,9 @@ func (s *DeviceState) PrepareVFIO(pciAddr string) (string, error) {
 // UnprepareVFIO rebinds an NVMe device from vfio-pci back to the nvme driver.
 func (s *DeviceState) UnprepareVFIO(pciAddr string) {
 	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
-	os.WriteFile(unbindPath, []byte(pciAddr), 0644)
+	if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
+		klog.Warningf("Failed to unbind %s from vfio-pci: %v", pciAddr, err)
+	}
 
 	bindPath := "/sys/bus/pci/drivers/nvme/bind"
 	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
