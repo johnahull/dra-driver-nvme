@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-driver-nvme
+  namespace: dra-nvme
+spec:
+  selector:
+    matchLabels:
+      app: dra-driver-nvme
+  template:
+    metadata:
+      labels:
+        app: dra-driver-nvme
+    spec:
+      serviceAccountName: dra-driver-nvme
+      containers:
+      - name: plugin
+        image: dra-driver-nvme:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /nvme-kubeletplugin
+        args:
+        - --node-name=$(NODE_NAME)
+        - --cdi-root=/var/run/cdi
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: plugins-registry
+          mountPath: /var/lib/kubelet/plugins_registry
+        - name: plugins
+          mountPath: /var/lib/kubelet/plugins
+          mountPropagation: Bidirectional
+        - name: cdi
+          mountPath: /var/run/cdi
+        - name: dev
+          mountPath: /dev
+        - name: sys
+          mountPath: /sys
+      volumes:
+      - name: plugins-registry
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry
+      - name: plugins
+        hostPath:
+          path: /var/lib/kubelet/plugins
+      - name: cdi
+        hostPath:
+          path: /var/run/cdi
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: sys
+        hostPath:
+          path: /sys
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dra-nvme
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dra-driver-nvme
+  namespace: dra-nvme
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dra-driver-nvme
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dra-driver-nvme
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dra-driver-nvme
+subjects:
+- kind: ServiceAccount
+  name: dra-driver-nvme
+  namespace: dra-nvme
