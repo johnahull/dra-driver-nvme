@@ -29,7 +29,7 @@ const (
 
 type DeviceState struct {
 	mu             sync.Mutex
-	allocatable    AllocatableDevices
+	allocatable    AllocatableDevices // immutable after initialization
 	prepared       map[string][]PreparedNvme
 	cdiCache       *cdiapi.Cache
 	checkpointPath string
@@ -296,8 +296,13 @@ func prepareVFIO(pciAddr string) (string, error) {
 
 	bindPath := "/sys/bus/pci/drivers/vfio-pci/bind"
 	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
-		// Clear override on failure
-		_ = os.WriteFile(overridePath, []byte(""), 0644)
+		if clearErr := os.WriteFile(overridePath, []byte(""), 0644); clearErr != nil {
+			klog.ErrorS(clearErr, "Failed to clear driver_override after bind failure", "pciAddr", pciAddr)
+		}
+		nvmeBindPath := "/sys/bus/pci/drivers/nvme/bind"
+		if rebindErr := os.WriteFile(nvmeBindPath, []byte(pciAddr), 0644); rebindErr != nil {
+			klog.V(2).InfoS("Failed to restore nvme driver after bind failure", "pciAddr", pciAddr, "err", rebindErr)
+		}
 		return "", fmt.Errorf("failed to bind to vfio-pci: %w", err)
 	}
 
@@ -318,8 +323,10 @@ func unprepareVFIO(pciAddr string) {
 	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
 	if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
 		klog.V(2).InfoS("Failed to unbind from vfio-pci", "pciAddr", pciAddr, "err", err)
-		return
 	}
+
+	overridePath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)
+	_ = os.WriteFile(overridePath, []byte(""), 0644)
 
 	bindPath := "/sys/bus/pci/drivers/nvme/bind"
 	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
@@ -335,10 +342,13 @@ type checkpoint struct {
 
 func (s *DeviceState) saveCheckpoint() error {
 	s.mu.Lock()
-	cp := checkpoint{Prepared: s.prepared}
+	preparedCopy := make(map[string][]PreparedNvme, len(s.prepared))
+	for k, v := range s.prepared {
+		preparedCopy[k] = append([]PreparedNvme(nil), v...)
+	}
 	s.mu.Unlock()
 
-	data, err := json.Marshal(cp)
+	data, err := json.Marshal(checkpoint{Prepared: preparedCopy})
 	if err != nil {
 		return fmt.Errorf("marshal checkpoint: %w", err)
 	}
@@ -366,8 +376,10 @@ func (s *DeviceState) restoreCheckpoint(logger klog.Logger) error {
 	}
 
 	if cp.Prepared != nil {
+		s.mu.Lock()
 		s.prepared = cp.Prepared
-		logger.Info("Restored checkpoint", "claims", len(s.prepared))
+		s.mu.Unlock()
+		logger.Info("Restored checkpoint", "claims", len(cp.Prepared))
 	}
 	return nil
 }
