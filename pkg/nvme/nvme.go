@@ -57,21 +57,21 @@ func Discover() ([]DeviceInfo, error) {
 		deviceLink := filepath.Join(ctrlPath, "device")
 		pciPath, err := os.Readlink(deviceLink)
 		if err != nil {
-			klog.Warningf("Skipping %s: cannot read device symlink: %v", ctrlName, err)
+			klog.V(2).InfoS("Skipping controller: cannot read device symlink", "controller", ctrlName, "err", err)
 			continue
 		}
 		pciAddr := filepath.Base(pciPath)
 
 		// Skip non-PCI devices (e.g., NVMe over Fabrics)
 		if !isPCIAddress(pciAddr) {
-			klog.Infof("Skipping %s: not a PCIe device (%s)", ctrlName, pciAddr)
+			klog.V(2).InfoS("Skipping controller: not a PCIe device", "controller", ctrlName, "address", pciAddr)
 			continue
 		}
 
 		// Read NUMA node
 		numaNode := readIntFile(filepath.Join(deviceLink, "numa_node"), -1)
 		if numaNode < 0 {
-			klog.Warningf("Skipping %s: invalid NUMA node", ctrlName)
+			klog.V(2).InfoS("Skipping controller: invalid NUMA node", "controller", ctrlName)
 			continue
 		}
 
@@ -111,12 +111,13 @@ func Discover() ([]DeviceInfo, error) {
 		}
 
 		if len(dev.Namespaces) == 0 {
-			klog.Warningf("Skipping %s: no namespaces found", ctrlName)
+			klog.V(2).InfoS("Skipping controller: no namespaces found", "controller", ctrlName)
 			continue
 		}
 
-		klog.Infof("Discovered NVMe: %s PCI=%s NUMA=%d model=%s size=%d namespaces=%d",
-			ctrlName, pciAddr, numaNode, dev.Model, dev.Namespaces[0].SizeBytes, len(dev.Namespaces))
+		klog.InfoS("Discovered NVMe controller",
+			"controller", ctrlName, "pci", pciAddr,
+			"numa", numaNode, "model", dev.Model, "namespaces", len(dev.Namespaces))
 		devices = append(devices, dev)
 	}
 

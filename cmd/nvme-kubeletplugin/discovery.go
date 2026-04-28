@@ -9,17 +9,14 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// AllocatableDevice wraps an NVMe device with its topology attributes.
 type AllocatableDevice struct {
 	Info         nvme.DeviceInfo
 	pciBusIDAttr deviceattribute.DeviceAttribute
 	pcieRootAttr deviceattribute.DeviceAttribute
 }
 
-// AllocatableDevices maps canonical device names to their allocatable device info.
 type AllocatableDevices map[string]*AllocatableDevice
 
-// SortedNames returns device names in sorted order for deterministic ResourceSlice publication.
 func (d AllocatableDevices) SortedNames() []string {
 	names := make([]string, 0, len(d))
 	for name := range d {
@@ -39,27 +36,29 @@ func enumerateDevices() (AllocatableDevices, error) {
 	for _, dev := range nvmeDevices {
 		pciBusIDAttr, err := deviceattribute.GetPCIBusIDAttribute(dev.PCIAddress)
 		if err != nil {
-			klog.Warningf("Failed to get PCI Bus ID attribute for %s: %v", dev.Controller, err)
+			klog.V(2).InfoS("Skipping device: failed to get PCI Bus ID attribute",
+				"controller", dev.Controller, "err", err)
 			continue
 		}
 
 		pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(dev.PCIAddress)
 		if err != nil {
-			klog.Warningf("Failed to get PCIe root attribute for %s: %v", dev.Controller, err)
+			klog.V(2).InfoS("Skipping device: failed to get PCIe root attribute",
+				"controller", dev.Controller, "err", err)
 			continue
 		}
 
-		// Use controller name as device name for stable identity across restarts
 		name := dev.Controller
 		devices[name] = &AllocatableDevice{
 			Info:         dev,
 			pciBusIDAttr: pciBusIDAttr,
 			pcieRootAttr: pcieRootAttr,
 		}
-		klog.Infof("Registered device %s: PCI=%s NUMA=%d socket=%d model=%s",
-			name, dev.PCIAddress, dev.NUMANode, dev.CPUSocketID, dev.Model)
+		klog.InfoS("Registered device",
+			"name", name, "pci", dev.PCIAddress,
+			"numa", dev.NUMANode, "socket", dev.CPUSocketID, "model", dev.Model)
 	}
 
-	klog.Infof("Discovered %d NVMe devices", len(devices))
+	klog.InfoS("NVMe discovery complete", "devices", len(devices))
 	return devices, nil
 }

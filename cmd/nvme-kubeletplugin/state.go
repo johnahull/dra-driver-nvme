@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,22 +21,24 @@ import (
 )
 
 const (
-	cdiVendor = "k8s.dra.nvme"
-	cdiClass  = "nvme"
-	cdiKind   = cdiVendor + "/" + cdiClass
+	cdiVendor      = "k8s.dra.nvme"
+	cdiClass       = "nvme"
+	cdiKind        = cdiVendor + "/" + cdiClass
+	checkpointFile = "prepared-claims.json"
 )
 
 type DeviceState struct {
-	sync.Mutex
-	allocatable AllocatableDevices
-	prepared    map[string][]PreparedNvme // claimUID -> prepared devices
-	cdiCache    *cdiapi.Cache
+	mu             sync.Mutex
+	allocatable    AllocatableDevices
+	prepared       map[string][]PreparedNvme
+	cdiCache       *cdiapi.Cache
+	checkpointPath string
 }
 
 type PreparedNvme struct {
 	drapbv1.Device
-	IsVFIO     bool
-	PCIAddress string
+	IsVFIO     bool   `json:"isVFIO"`
+	PCIAddress string `json:"pciAddress"`
 }
 
 type OpaqueDeviceConfig struct {
@@ -42,7 +46,9 @@ type OpaqueDeviceConfig struct {
 	Config   runtime.Object
 }
 
-func NewDeviceState(f *flags) (*DeviceState, error) {
+func NewDeviceState(ctx context.Context, f *flags) (*DeviceState, error) {
+	logger := klog.FromContext(ctx)
+
 	allocatable, err := enumerateDevices()
 	if err != nil {
 		return nil, err
@@ -53,57 +59,63 @@ func NewDeviceState(f *flags) (*DeviceState, error) {
 		return nil, fmt.Errorf("failed to create CDI cache: %w", err)
 	}
 
-	return &DeviceState{
-		allocatable: allocatable,
-		prepared:    make(map[string][]PreparedNvme),
-		cdiCache:    cache,
-	}, nil
+	checkpointPath := filepath.Join(f.pluginDataDirectoryPath, checkpointFile)
+
+	s := &DeviceState{
+		allocatable:    allocatable,
+		prepared:       make(map[string][]PreparedNvme),
+		cdiCache:       cache,
+		checkpointPath: checkpointPath,
+	}
+
+	if err := s.restoreCheckpoint(logger); err != nil {
+		logger.Error(err, "Failed to restore checkpoint, starting fresh")
+	}
+
+	return s, nil
 }
 
-func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme, error) {
-	s.Lock()
-	defer s.Unlock()
-
+func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceClaim) ([]PreparedNvme, error) {
+	logger := klog.FromContext(ctx)
 	claimUID := string(claim.UID)
 
-	// Return already-prepared devices
+	s.mu.Lock()
 	if existing, ok := s.prepared[claimUID]; ok {
+		s.mu.Unlock()
 		return existing, nil
 	}
+	s.mu.Unlock()
 
 	if claim.Status.Allocation == nil {
 		return nil, fmt.Errorf("claim not yet allocated")
 	}
 
-	// Parse opaque configs to determine mode (block vs vfio)
 	configs, err := getOpaqueDeviceConfigs(claim.Status.Allocation.Devices.Config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting device configs: %w", err)
 	}
 
-	// Add default config at lowest precedence
 	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{
 		Requests: []string{},
 		Config:   nvmeapi.DefaultNvmeConfig(),
 	})
 
-	// Map each allocation result to its config
 	type deviceWithConfig struct {
 		result *resourceapi.DeviceRequestAllocationResult
 		config *nvmeapi.NvmeConfig
 	}
-	var devicesWithConfig []deviceWithConfig
 
+	s.mu.Lock()
+	var devicesWithConfig []deviceWithConfig
 	for _, result := range claim.Status.Allocation.Devices.Results {
-		// Skip devices from other drivers in multi-driver claims
 		if result.Driver != DriverName {
 			continue
 		}
 		if _, exists := s.allocatable[result.Device]; !exists {
+			s.mu.Unlock()
 			return nil, fmt.Errorf("NVMe device not found: %s", result.Device)
 		}
 
-		// Find matching config (last match wins)
 		var matchedConfig *nvmeapi.NvmeConfig
 		for _, c := range slices.Backward(configs) {
 			if len(c.Requests) == 0 || slices.Contains(c.Requests, result.Request) {
@@ -119,9 +131,11 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 		}
 
 		if err := matchedConfig.Normalize(); err != nil {
+			s.mu.Unlock()
 			return nil, fmt.Errorf("error normalizing config for %s: %w", result.Device, err)
 		}
 		if err := matchedConfig.Validate(); err != nil {
+			s.mu.Unlock()
 			return nil, fmt.Errorf("error validating config for %s: %w", result.Device, err)
 		}
 
@@ -131,27 +145,27 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 			config: matchedConfig,
 		})
 	}
+	s.mu.Unlock()
 
-	// Prepare each device according to its config.
-	// Track VFIO-bound devices for rollback on partial failure.
 	var cdiDevices []cdispec.Device
 	var prepared []PreparedNvme
-	var vfioBound []string // PCI addresses bound to vfio-pci so far
+	var vfioBound []string
 
 	for _, dwc := range devicesWithConfig {
 		result := dwc.result
+
+		s.mu.Lock()
 		allocDev := s.allocatable[result.Device]
+		s.mu.Unlock()
 
 		var deviceNodes []*cdispec.DeviceNode
 		isVFIO := dwc.config.Mode == "vfio"
 
 		if isVFIO {
-			// VFIO mode: bind to vfio-pci
-			iommuGroup, err := s.prepareVFIO(allocDev.Info.PCIAddress)
+			iommuGroup, err := prepareVFIO(allocDev.Info.PCIAddress)
 			if err != nil {
-				// Rollback any VFIO bindings done so far
 				for _, addr := range vfioBound {
-					s.unprepareVFIO(addr)
+					unprepareVFIO(addr)
 				}
 				return nil, fmt.Errorf("VFIO prepare failed for %s: %w", result.Device, err)
 			}
@@ -163,10 +177,9 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 				{Path: vfioDevPath, HostPath: vfioDevPath, Type: "c"},
 			}
 
-			klog.Infof("Prepared NVMe %s (VFIO) for claim %s: PCI=%s IOMMU=%s",
-				result.Device, claimUID, allocDev.Info.PCIAddress, iommuGroup)
+			logger.Info("Prepared NVMe VFIO", "device", result.Device, "claim", claimUID,
+				"pci", allocDev.Info.PCIAddress, "iommuGroup", iommuGroup)
 		} else {
-			// Block mode: expose /dev/nvme* devices
 			ctrlPath := fmt.Sprintf("/dev/%s", allocDev.Info.Controller)
 			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
 				Path: ctrlPath, HostPath: ctrlPath, Type: "c",
@@ -177,8 +190,8 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 				})
 			}
 
-			klog.Infof("Prepared NVMe %s (block) for claim %s: PCI=%s namespaces=%d",
-				result.Device, claimUID, allocDev.Info.PCIAddress, len(allocDev.Info.Namespaces))
+			logger.Info("Prepared NVMe block", "device", result.Device, "claim", claimUID,
+				"pci", allocDev.Info.PCIAddress, "namespaces", len(allocDev.Info.Namespaces))
 		}
 
 		cdiDeviceName := fmt.Sprintf("%s-%s", claimUID, result.Device)
@@ -200,7 +213,6 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 		})
 	}
 
-	// Write one CDI spec per claim containing all devices
 	if len(cdiDevices) > 0 {
 		specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 		spec := &cdispec.Spec{
@@ -210,7 +222,7 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 		minVersion, err := cdiapi.MinimumRequiredVersion(spec)
 		if err != nil {
 			for _, addr := range vfioBound {
-				s.unprepareVFIO(addr)
+				unprepareVFIO(addr)
 			}
 			return nil, fmt.Errorf("failed to get CDI spec version: %w", err)
 		}
@@ -218,100 +230,148 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]PreparedNvme,
 
 		if err := s.cdiCache.WriteSpec(spec, specName); err != nil {
 			for _, addr := range vfioBound {
-				s.unprepareVFIO(addr)
+				unprepareVFIO(addr)
 			}
 			return nil, fmt.Errorf("failed to write CDI spec: %w", err)
 		}
 	}
 
+	s.mu.Lock()
 	s.prepared[claimUID] = prepared
+	s.mu.Unlock()
+
+	if err := s.saveCheckpoint(); err != nil {
+		logger.Error(err, "Failed to save checkpoint")
+	}
+
 	return prepared, nil
 }
 
-func (s *DeviceState) Unprepare(claimUID string) error {
-	s.Lock()
-	defer s.Unlock()
+func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
+	logger := klog.FromContext(ctx)
 
+	s.mu.Lock()
 	devices, ok := s.prepared[claimUID]
 	if !ok {
+		s.mu.Unlock()
 		return nil
 	}
+	delete(s.prepared, claimUID)
+	s.mu.Unlock()
 
-	// Rebind any VFIO devices back to nvme
 	for _, dev := range devices {
 		if dev.IsVFIO && dev.PCIAddress != "" {
-			s.unprepareVFIO(dev.PCIAddress)
+			unprepareVFIO(dev.PCIAddress)
 		}
 	}
 
-	// Remove CDI spec
 	specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 	if err := s.cdiCache.RemoveSpec(specName); err != nil {
-		klog.Warningf("Failed to remove CDI spec for claim %s: %v", claimUID, err)
+		logger.V(2).Info("Failed to remove CDI spec", "claim", claimUID, "err", err)
 	}
 
-	delete(s.prepared, claimUID)
-	klog.Infof("Unprepared NVMe devices for claim %s", claimUID)
+	if err := s.saveCheckpoint(); err != nil {
+		logger.Error(err, "Failed to save checkpoint")
+	}
+
+	logger.Info("Unprepared NVMe devices", "claim", claimUID, "devices", len(devices))
 	return nil
 }
 
-// prepareVFIO binds an NVMe device to vfio-pci and returns the IOMMU group.
-func (s *DeviceState) prepareVFIO(pciAddr string) (string, error) {
-	// Unbind from current driver
+func prepareVFIO(pciAddr string) (string, error) {
 	driverPath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)
 	if target, err := os.Readlink(driverPath); err == nil {
 		currentDriver := filepath.Base(target)
-		klog.Infof("Unbinding %s from %s", pciAddr, currentDriver)
+		klog.V(2).InfoS("Unbinding device", "pciAddr", pciAddr, "driver", currentDriver)
 		unbindPath := fmt.Sprintf("/sys/bus/pci/drivers/%s/unbind", currentDriver)
 		if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
 			return "", fmt.Errorf("failed to unbind %s: %w", pciAddr, err)
 		}
 	}
 
-	// Set driver_override to vfio-pci
 	overridePath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)
 	if err := os.WriteFile(overridePath, []byte("vfio-pci"), 0644); err != nil {
 		return "", fmt.Errorf("failed to set driver_override: %w", err)
 	}
 
-	// Bind to vfio-pci
 	bindPath := "/sys/bus/pci/drivers/vfio-pci/bind"
 	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
+		// Clear override on failure
+		_ = os.WriteFile(overridePath, []byte(""), 0644)
 		return "", fmt.Errorf("failed to bind to vfio-pci: %w", err)
 	}
 
-	// Clear driver_override
 	if err := os.WriteFile(overridePath, []byte(""), 0644); err != nil {
-		klog.Warningf("Failed to clear driver_override for %s: %v", pciAddr, err)
+		klog.V(2).InfoS("Failed to clear driver_override", "pciAddr", pciAddr, "err", err)
 	}
 
-	// Get IOMMU group
 	iommuLink := fmt.Sprintf("/sys/bus/pci/devices/%s/iommu_group", pciAddr)
 	target, err := os.Readlink(iommuLink)
 	if err != nil {
 		return "", fmt.Errorf("failed to read IOMMU group: %w", err)
 	}
-	iommuGroup := filepath.Base(target)
 
-	klog.Infof("Bound %s to vfio-pci, IOMMU group %s", pciAddr, iommuGroup)
-	return iommuGroup, nil
+	return filepath.Base(target), nil
 }
 
-// unprepareVFIO rebinds an NVMe device from vfio-pci back to the nvme driver.
-func (s *DeviceState) unprepareVFIO(pciAddr string) {
+func unprepareVFIO(pciAddr string) {
 	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
 	if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
-		klog.Warningf("Failed to unbind %s from vfio-pci: %v", pciAddr, err)
+		klog.V(2).InfoS("Failed to unbind from vfio-pci", "pciAddr", pciAddr, "err", err)
+		return
 	}
 
 	bindPath := "/sys/bus/pci/drivers/nvme/bind"
 	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
-		klog.Warningf("Failed to rebind %s to nvme: %v", pciAddr, err)
+		klog.V(2).InfoS("Failed to rebind to nvme", "pciAddr", pciAddr, "err", err)
 	}
 }
 
-// getOpaqueDeviceConfigs extracts NvmeConfig objects from the claim's allocation configs.
-// Returns configs in order of precedence (lowest first): class configs, then claim configs.
+// Checkpoint persistence
+
+type checkpoint struct {
+	Prepared map[string][]PreparedNvme `json:"prepared"`
+}
+
+func (s *DeviceState) saveCheckpoint() error {
+	s.mu.Lock()
+	cp := checkpoint{Prepared: s.prepared}
+	s.mu.Unlock()
+
+	data, err := json.Marshal(cp)
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint: %w", err)
+	}
+
+	dir := filepath.Dir(s.checkpointPath)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return fmt.Errorf("create checkpoint dir: %w", err)
+	}
+
+	return os.WriteFile(s.checkpointPath, data, 0600)
+}
+
+func (s *DeviceState) restoreCheckpoint(logger klog.Logger) error {
+	data, err := os.ReadFile(s.checkpointPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read checkpoint: %w", err)
+	}
+
+	var cp checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return fmt.Errorf("unmarshal checkpoint: %w", err)
+	}
+
+	if cp.Prepared != nil {
+		s.prepared = cp.Prepared
+		logger.Info("Restored checkpoint", "claims", len(s.prepared))
+	}
+	return nil
+}
+
 func getOpaqueDeviceConfigs(configs []resourceapi.DeviceAllocationConfiguration) ([]*OpaqueDeviceConfig, error) {
 	var classConfigs, claimConfigs []*OpaqueDeviceConfig
 	for _, config := range configs {
@@ -336,6 +396,5 @@ func getOpaqueDeviceConfigs(configs []resourceapi.DeviceAllocationConfiguration)
 			claimConfigs = append(claimConfigs, odc)
 		}
 	}
-	// Class configs first (lowest precedence), then claim configs (highest)
 	return append(classConfigs, claimConfigs...), nil
 }

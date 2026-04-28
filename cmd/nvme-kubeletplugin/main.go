@@ -55,13 +55,14 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	driver, err := NewDriver(ctx, clientset, f)
+	driver, err := NewDriver(ctx, cancel, clientset, f)
 	if err != nil {
 		klog.Fatalf("Failed to create driver: %v", err)
 	}
 
-	klog.Infof("NVMe DRA driver started on node %s", f.nodeName)
+	logger := klog.FromContext(ctx)
+	logger.Info("NVMe DRA driver started", "node", f.nodeName)
 	<-ctx.Done()
-	klog.Info("Shutting down")
+	logger.Info("Shutting down")
 	driver.Shutdown()
 }
