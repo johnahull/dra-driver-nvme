@@ -115,6 +115,12 @@ func Discover() ([]DeviceInfo, error) {
 			continue
 		}
 
+		if hasMountedNamespace(dev.Namespaces) {
+			klog.InfoS("Skipping controller: has mounted namespace (likely boot/root disk)",
+				"controller", ctrlName, "pci", pciAddr)
+			continue
+		}
+
 		klog.InfoS("Discovered NVMe controller",
 			"controller", ctrlName, "pci", pciAddr,
 			"numa", numaNode, "model", dev.Model, "namespaces", len(dev.Namespaces))
@@ -157,6 +163,43 @@ func readIntFile(path string, defaultVal int) int {
 func sanitize(s string) string {
 	r := strings.NewReplacer(" ", "_", "(", "", ")", "", "\t", "")
 	return r.Replace(s)
+}
+
+// hasMountedNamespace checks if any namespace on an NVMe controller has
+// mounted partitions or active device-mapper entries. Reads /proc/1/mounts
+// to see the host's mount table (works inside containers). Falls back to
+// /proc/mounts if /proc/1/mounts is unavailable.
+func hasMountedNamespace(namespaces []NamespaceInfo) bool {
+	var mounts []byte
+	var err error
+	for _, path := range []string{"/proc/1/mounts", "/proc/mounts"} {
+		mounts, err = os.ReadFile(path)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return false
+	}
+	mountStr := string(mounts)
+	for _, ns := range namespaces {
+		if strings.Contains(mountStr, ns.DevicePath) || strings.Contains(mountStr, ns.Name) {
+			return true
+		}
+		// Check for LVM/device-mapper on partitions (e.g., nvme0n1p3 → dm-0)
+		parts, _ := filepath.Glob(fmt.Sprintf("/sys/block/%s/%s*", ns.Name, ns.Name))
+		for _, part := range parts {
+			partName := filepath.Base(part)
+			if strings.Contains(mountStr, partName) {
+				return true
+			}
+			holders, _ := filepath.Glob(filepath.Join(part, "holders", "*"))
+			if len(holders) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // getSocketIDForNUMA derives the CPU physical_package_id (socket) for a NUMA node
