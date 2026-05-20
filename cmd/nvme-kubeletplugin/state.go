@@ -53,6 +53,13 @@ type PreparedNvme struct {
 	drapbv1.Device
 	IsVFIO     bool   `json:"isVFIO"`
 	PCIAddress string `json:"pciAddress"`
+	UseIOMMUFD bool   `json:"useIOMMUFD,omitempty"`
+}
+
+type vfioResult struct {
+	IOMMUGroup string
+	UseIOMMUFD bool
+	DevicePath string
 }
 
 type OpaqueDeviceConfig struct {
@@ -173,10 +180,12 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		s.mu.Unlock()
 
 		var deviceNodes []*cdispec.DeviceNode
+		var vfio *vfioResult
 		isVFIO := dwc.config.Mode == "vfio"
 
 		if isVFIO {
-			iommuGroup, err := prepareVFIO(allocDev.Info.PCIAddress)
+			var err error
+			vfio, err = prepareVFIO(allocDev.Info.PCIAddress, dwc.config.Force)
 			if err != nil {
 				for _, addr := range vfioBound {
 					unprepareVFIO(addr)
@@ -185,14 +194,22 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 			}
 			vfioBound = append(vfioBound, allocDev.Info.PCIAddress)
 
-			vfioDevPath := fmt.Sprintf("/dev/vfio/%s", iommuGroup)
-			deviceNodes = []*cdispec.DeviceNode{
-				{Path: "/dev/vfio/vfio", HostPath: "/dev/vfio/vfio", Type: "c"},
-				{Path: vfioDevPath, HostPath: vfioDevPath, Type: "c"},
+			if vfio.UseIOMMUFD {
+				deviceNodes = []*cdispec.DeviceNode{
+					{Path: "/dev/iommu", HostPath: "/dev/iommu", Type: "c"},
+					{Path: vfio.DevicePath, HostPath: vfio.DevicePath, Type: "c"},
+				}
+			} else {
+				vfioDevPath := fmt.Sprintf("/dev/vfio/%s", vfio.IOMMUGroup)
+				deviceNodes = []*cdispec.DeviceNode{
+					{Path: "/dev/vfio/vfio", HostPath: "/dev/vfio/vfio", Type: "c"},
+					{Path: vfioDevPath, HostPath: vfioDevPath, Type: "c"},
+				}
 			}
 
 			logger.Info("Prepared NVMe VFIO", "device", result.Device, "claim", claimUID,
-				"pci", allocDev.Info.PCIAddress, "iommuGroup", iommuGroup)
+				"pci", allocDev.Info.PCIAddress, "iommuGroup", vfio.IOMMUGroup,
+				"iommufd", vfio.UseIOMMUFD)
 		} else {
 			ctrlPath := fmt.Sprintf("/dev/%s", allocDev.Info.Controller)
 			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
@@ -215,7 +232,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		})
 
 		cdiDeviceID := cdiparser.QualifiedName(cdiVendor, cdiClass, cdiDeviceName)
-		prepared = append(prepared, PreparedNvme{
+		pnvme := PreparedNvme{
 			Device: drapbv1.Device{
 				RequestNames: []string{result.Request},
 				PoolName:     result.Pool,
@@ -224,7 +241,11 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 			},
 			IsVFIO:     isVFIO,
 			PCIAddress: allocDev.Info.PCIAddress,
-		})
+		}
+		if isVFIO {
+			pnvme.UseIOMMUFD = vfio.UseIOMMUFD
+		}
+		prepared = append(prepared, pnvme)
 	}
 
 	if len(cdiDevices) > 0 {
@@ -292,58 +313,136 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 	return nil
 }
 
-func prepareVFIO(pciAddr string) (string, error) {
+func checkIOMMUGroupSafety(pciAddr string) (string, []string, error) {
+	iommuLink := fmt.Sprintf("/sys/bus/pci/devices/%s/iommu_group", pciAddr)
+	target, err := sysfs.ReadLink(iommuLink)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read IOMMU group for %s: %w", pciAddr, err)
+	}
+	groupID := filepath.Base(target)
+
+	devicesDir := fmt.Sprintf("/sys/bus/pci/devices/%s/iommu_group/devices", pciAddr)
+	entries, err := sysfs.ReadDir(devicesDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to list IOMMU group %s devices: %w", groupID, err)
+	}
+
+	var conflicts []string
+	for _, entry := range entries {
+		coAddr := entry.Name()
+		if coAddr == pciAddr {
+			continue
+		}
+		driverLink := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", coAddr)
+		driverTarget, err := sysfs.ReadLink(driverLink)
+		if err != nil {
+			continue
+		}
+		driver := filepath.Base(driverTarget)
+		if driver != "vfio-pci" {
+			conflicts = append(conflicts, fmt.Sprintf("%s (%s)", coAddr, driver))
+		}
+	}
+
+	return groupID, conflicts, nil
+}
+
+func detectIOMMUFD() bool {
+	_, err := sysfs.Stat("/dev/iommu")
+	return err == nil
+}
+
+func findVFIODevice(pciAddr string) (string, error) {
+	vfioDevDir := fmt.Sprintf("/sys/bus/pci/devices/%s/vfio-dev", pciAddr)
+	entries, err := sysfs.ReadDir(vfioDevDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read vfio-dev for %s: %w", pciAddr, err)
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("no vfio-dev entry for %s", pciAddr)
+	}
+	return fmt.Sprintf("/dev/vfio/devices/%s", entries[0].Name()), nil
+}
+
+func prepareVFIO(pciAddr string, force bool) (*vfioResult, error) {
+	groupID, conflicts, err := checkIOMMUGroupSafety(pciAddr)
+	if err != nil {
+		return nil, fmt.Errorf("IOMMU group safety check failed for %s: %w", pciAddr, err)
+	}
+
+	useIOMMUFD := detectIOMMUFD()
+
+	if len(conflicts) > 0 {
+		if useIOMMUFD {
+			klog.InfoS("IOMMU group has co-grouped devices but iommufd provides per-device isolation",
+				"pciAddr", pciAddr, "group", groupID, "conflicts", conflicts)
+		} else if force {
+			klog.InfoS("IOMMU group has co-grouped devices, proceeding due to force flag",
+				"pciAddr", pciAddr, "group", groupID, "conflicts", conflicts)
+		} else {
+			return nil, fmt.Errorf("IOMMU group %s has devices bound to non-vfio-pci drivers: %v; "+
+				"set force=true in NvmeConfig to override", groupID, conflicts)
+		}
+	}
+
 	driverPath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)
-	if target, err := os.Readlink(driverPath); err == nil {
+	if target, err := sysfs.ReadLink(driverPath); err == nil {
 		currentDriver := filepath.Base(target)
 		klog.V(2).InfoS("Unbinding device", "pciAddr", pciAddr, "driver", currentDriver)
 		unbindPath := fmt.Sprintf("/sys/bus/pci/drivers/%s/unbind", currentDriver)
-		if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
-			return "", fmt.Errorf("failed to unbind %s: %w", pciAddr, err)
+		if err := sysfs.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
+			return nil, fmt.Errorf("failed to unbind %s: %w", pciAddr, err)
 		}
 	}
 
 	overridePath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)
-	if err := os.WriteFile(overridePath, []byte("vfio-pci"), 0644); err != nil {
-		return "", fmt.Errorf("failed to set driver_override: %w", err)
+	if err := sysfs.WriteFile(overridePath, []byte("vfio-pci"), 0644); err != nil {
+		return nil, fmt.Errorf("failed to set driver_override: %w", err)
 	}
 
 	bindPath := "/sys/bus/pci/drivers/vfio-pci/bind"
-	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
-		if clearErr := os.WriteFile(overridePath, []byte(""), 0644); clearErr != nil {
+	if err := sysfs.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
+		if clearErr := sysfs.WriteFile(overridePath, []byte(""), 0644); clearErr != nil {
 			klog.ErrorS(clearErr, "Failed to clear driver_override after bind failure", "pciAddr", pciAddr)
 		}
 		nvmeBindPath := "/sys/bus/pci/drivers/nvme/bind"
-		if rebindErr := os.WriteFile(nvmeBindPath, []byte(pciAddr), 0644); rebindErr != nil {
+		if rebindErr := sysfs.WriteFile(nvmeBindPath, []byte(pciAddr), 0644); rebindErr != nil {
 			klog.V(2).InfoS("Failed to restore nvme driver after bind failure", "pciAddr", pciAddr, "err", rebindErr)
 		}
-		return "", fmt.Errorf("failed to bind to vfio-pci: %w", err)
+		return nil, fmt.Errorf("failed to bind to vfio-pci: %w", err)
 	}
 
-	if err := os.WriteFile(overridePath, []byte(""), 0644); err != nil {
+	if err := sysfs.WriteFile(overridePath, []byte(""), 0644); err != nil {
 		klog.V(2).InfoS("Failed to clear driver_override", "pciAddr", pciAddr, "err", err)
 	}
 
-	iommuLink := fmt.Sprintf("/sys/bus/pci/devices/%s/iommu_group", pciAddr)
-	target, err := os.Readlink(iommuLink)
-	if err != nil {
-		return "", fmt.Errorf("failed to read IOMMU group: %w", err)
+	result := &vfioResult{IOMMUGroup: groupID}
+
+	if useIOMMUFD {
+		devPath, err := findVFIODevice(pciAddr)
+		if err != nil {
+			klog.V(2).InfoS("iommufd detected but vfio-dev lookup failed, falling back to legacy",
+				"pciAddr", pciAddr, "err", err)
+		} else {
+			result.UseIOMMUFD = true
+			result.DevicePath = devPath
+		}
 	}
 
-	return filepath.Base(target), nil
+	return result, nil
 }
 
 func unprepareVFIO(pciAddr string) {
 	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
-	if err := os.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
+	if err := sysfs.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
 		klog.V(2).InfoS("Failed to unbind from vfio-pci", "pciAddr", pciAddr, "err", err)
 	}
 
 	overridePath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)
-	_ = os.WriteFile(overridePath, []byte(""), 0644)
+	_ = sysfs.WriteFile(overridePath, []byte(""), 0644)
 
 	bindPath := "/sys/bus/pci/drivers/nvme/bind"
-	if err := os.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
+	if err := sysfs.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
 		klog.V(2).InfoS("Failed to rebind to nvme", "pciAddr", pciAddr, "err", err)
 	}
 }

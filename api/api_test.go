@@ -132,3 +132,39 @@ func TestDecoder(t *testing.T) {
 		t.Errorf("mode = %q, want \"vfio\"", config.Mode)
 	}
 }
+
+func TestDecoderWithForce(t *testing.T) {
+	raw := []byte(`{"apiVersion":"nvme.dra.io/v1alpha1","kind":"NvmeConfig","mode":"vfio","force":true}`)
+	obj, _, err := Decoder.Decode(raw, nil, nil)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	config := obj.(*NvmeConfig)
+	if !config.Force {
+		t.Error("expected Force=true")
+	}
+}
+
+func TestDecoderForceDefaultsFalse(t *testing.T) {
+	raw := []byte(`{"apiVersion":"nvme.dra.io/v1alpha1","kind":"NvmeConfig","mode":"block"}`)
+	obj, _, err := Decoder.Decode(raw, nil, nil)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	config := obj.(*NvmeConfig)
+	if config.Force {
+		t.Error("expected Force=false when omitted")
+	}
+}
+
+func TestDeepCopyPreservesForce(t *testing.T) {
+	c := &NvmeConfig{Mode: "vfio", Force: true}
+	cp := c.DeepCopyObject().(*NvmeConfig)
+	if !cp.Force {
+		t.Error("DeepCopy did not preserve Force=true")
+	}
+	cp.Force = false
+	if !c.Force {
+		t.Error("DeepCopy mutated original Force field")
+	}
+}

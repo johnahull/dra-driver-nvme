@@ -38,7 +38,8 @@ type NvmeConfig struct {
 	// Mode selects the device exposure mode.
 	// "block" (default) exposes /dev/nvme*n* block devices.
 	// "vfio" binds to vfio-pci for VM passthrough.
-	Mode string `json:"mode,omitempty"`
+	Mode  string `json:"mode,omitempty"`
+	Force bool   `json:"force,omitempty"`
 }
 
 func (c *NvmeConfig) DeepCopyObject() runtime.Object {
