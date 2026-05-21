@@ -1,0 +1,35 @@
+{{- if .Values.deviceClass.block.enabled }}
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: {{ .Values.deviceClass.block.name }}
+  labels:
+    {{- include "dra-driver-nvme.labels" . | nindent 4 }}
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == \"dra.nvme\""
+{{- end }}
+---
+{{- if .Values.deviceClass.vfio.enabled }}
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: {{ .Values.deviceClass.vfio.name }}
+  labels:
+    {{- include "dra-driver-nvme.labels" . | nindent 4 }}
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == \"dra.nvme\""
+  config:
+  - opaque:
+      driver: dra.nvme
+      parameters:
+        apiVersion: nvme.dra.io/v1alpha1
+        kind: NvmeConfig
+        mode: vfio
+        {{- if .Values.deviceClass.vfio.force }}
+        force: true
+        {{- end }}
+{{- end }}

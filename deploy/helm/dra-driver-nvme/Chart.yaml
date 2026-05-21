@@ -1,0 +1,15 @@
+apiVersion: v2
+name: dra-driver-nvme
+description: Kubernetes DRA driver for NVMe device allocation with block and VFIO passthrough modes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - nvme
+  - dra
+  - vfio
+  - dynamic-resource-allocation
+  - device-plugin
+home: https://github.com/johnahull/dra-driver-nvme
+maintainers:
+  - name: John Hull

@@ -1,0 +1,8 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "dra-driver-nvme.namespace" . }}
+  labels:
+    {{- include "dra-driver-nvme.labels" . | nindent 4 }}
+{{- end }}

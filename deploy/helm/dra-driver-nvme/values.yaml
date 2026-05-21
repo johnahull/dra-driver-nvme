@@ -1,0 +1,67 @@
+# Platform: "kubernetes" or "openshift"
+# OpenShift creates a SecurityContextConstraints resource for privileged access.
+platform: kubernetes
+
+image:
+  repository: ghcr.io/johnahull/dra-driver-nvme
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+# - name: my-registry-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+namespace:
+  create: true
+  name: dra-nvme
+
+serviceAccount:
+  create: true
+  # Override the service account name (defaults to chart fullname)
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+
+# DeviceClass resources for DRA allocation
+deviceClass:
+  block:
+    enabled: true
+    name: dra.nvme
+  vfio:
+    enabled: true
+    name: dra.nvme-vfio
+    # Allow VFIO binding even when co-grouped devices have active drivers
+    force: false
+
+# Plugin configuration
+plugin:
+  cdiRoot: /var/run/cdi
+  # Additional CLI arguments passed to the plugin binary
+  extraArgs: []
+  # - --v=4
+  # Additional environment variables
+  extraEnv: []
+  # - name: MY_VAR
+  #   value: "my-value"
+
+resources: {}
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 50m
+  #   memory: 64Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+priorityClassName: ""
+
+podAnnotations: {}

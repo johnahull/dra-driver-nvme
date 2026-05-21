@@ -1,4 +1,6 @@
-.PHONY: build test test-unit test-e2e lint vet
+HELM_CHART := deploy/helm/dra-driver-nvme
+
+.PHONY: build test test-unit test-e2e lint vet helm-lint helm-template
 
 build:
 	CGO_ENABLED=0 go build -o nvme-kubeletplugin ./cmd/nvme-kubeletplugin/
@@ -14,4 +16,10 @@ test-e2e:
 vet:
 	go vet ./...
 
-lint: vet
+lint: vet helm-lint
+
+helm-lint:
+	helm lint $(HELM_CHART)
+
+helm-template:
+	helm template test $(HELM_CHART)
