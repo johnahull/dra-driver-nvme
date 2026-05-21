@@ -44,7 +44,7 @@ const (
 type DeviceState struct {
 	mu             sync.Mutex
 	allocatable    AllocatableDevices // immutable after initialization
-	prepared       map[string][]PreparedNvme
+	prepared       map[string][]*PreparedNvme
 	cdiCache       *cdiapi.Cache
 	checkpointPath string
 }
@@ -84,7 +84,7 @@ func NewDeviceState(ctx context.Context, f *flags) (*DeviceState, error) {
 
 	s := &DeviceState{
 		allocatable:    allocatable,
-		prepared:       make(map[string][]PreparedNvme),
+		prepared:       make(map[string][]*PreparedNvme),
 		cdiCache:       cache,
 		checkpointPath: checkpointPath,
 	}
@@ -96,7 +96,7 @@ func NewDeviceState(ctx context.Context, f *flags) (*DeviceState, error) {
 	return s, nil
 }
 
-func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceClaim) ([]PreparedNvme, error) {
+func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceClaim) ([]*PreparedNvme, error) {
 	logger := klog.FromContext(ctx)
 	claimUID := string(claim.UID)
 
@@ -169,7 +169,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	s.mu.Unlock()
 
 	var cdiDevices []cdispec.Device
-	var prepared []PreparedNvme
+	var prepared []*PreparedNvme
 	var vfioBound []string
 
 	for _, dwc := range devicesWithConfig {
@@ -232,7 +232,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		})
 
 		cdiDeviceID := cdiparser.QualifiedName(cdiVendor, cdiClass, cdiDeviceName)
-		pnvme := PreparedNvme{
+		pnvme := &PreparedNvme{
 			Device: drapbv1.Device{
 				RequestNames: []string{result.Request},
 				PoolName:     result.Pool,
@@ -450,14 +450,14 @@ func unprepareVFIO(pciAddr string) {
 // Checkpoint persistence
 
 type checkpoint struct {
-	Prepared map[string][]PreparedNvme `json:"prepared"`
+	Prepared map[string][]*PreparedNvme `json:"prepared"`
 }
 
 func (s *DeviceState) saveCheckpoint() error {
 	s.mu.Lock()
-	preparedCopy := make(map[string][]PreparedNvme, len(s.prepared))
+	preparedCopy := make(map[string][]*PreparedNvme, len(s.prepared))
 	for k, v := range s.prepared {
-		preparedCopy[k] = append([]PreparedNvme(nil), v...)
+		preparedCopy[k] = append([]*PreparedNvme(nil), v...)
 	}
 	s.mu.Unlock()
 

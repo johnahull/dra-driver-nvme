@@ -684,7 +684,7 @@ func TestCheckpointBackwardCompat(t *testing.T) {
 
 func TestCheckpointWithIOMMUFD(t *testing.T) {
 	original := checkpoint{
-		Prepared: map[string][]PreparedNvme{
+		Prepared: map[string][]*PreparedNvme{
 			"uid1": {
 				{IsVFIO: true, PCIAddress: "0000:3b:00.0", UseIOMMUFD: true},
 			},
