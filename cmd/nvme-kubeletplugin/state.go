@@ -45,6 +45,7 @@ type DeviceState struct {
 	mu             sync.Mutex
 	allocatable    AllocatableDevices // immutable after initialization
 	prepared       map[string][]*PreparedNvme
+	preparing      map[string]bool
 	cdiCache       *cdiapi.Cache
 	checkpointPath string
 }
@@ -85,6 +86,7 @@ func NewDeviceState(ctx context.Context, f *flags) (*DeviceState, error) {
 	s := &DeviceState{
 		allocatable:    allocatable,
 		prepared:       make(map[string][]*PreparedNvme),
+		preparing:      make(map[string]bool),
 		cdiCache:       cache,
 		checkpointPath: checkpointPath,
 	}
@@ -105,7 +107,17 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		s.mu.Unlock()
 		return existing, nil
 	}
+	if s.preparing[claimUID] {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("claim %s is already being prepared", claimUID)
+	}
+	s.preparing[claimUID] = true
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.preparing, claimUID)
+		s.mu.Unlock()
+	}()
 
 	if claim.Status.Allocation == nil {
 		return nil, fmt.Errorf("claim not yet allocated")
@@ -336,7 +348,10 @@ func checkIOMMUGroupSafety(pciAddr string) (string, []string, error) {
 		driverLink := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", coAddr)
 		driverTarget, err := sysfs.ReadLink(driverLink)
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", nil, fmt.Errorf("failed to check driver for co-grouped device %s: %w", coAddr, err)
 		}
 		driver := filepath.Base(driverTarget)
 		if driver != "vfio-pci" {
@@ -421,7 +436,7 @@ func prepareVFIO(pciAddr string, force bool) (*vfioResult, error) {
 	if useIOMMUFD {
 		devPath, err := findVFIODevice(pciAddr)
 		if err != nil {
-			klog.V(2).InfoS("iommufd detected but vfio-dev lookup failed, falling back to legacy",
+			klog.InfoS("WARNING: iommufd detected but vfio-dev lookup failed, falling back to legacy VFIO",
 				"pciAddr", pciAddr, "err", err)
 		} else {
 			result.UseIOMMUFD = true
@@ -471,7 +486,11 @@ func (s *DeviceState) saveCheckpoint() error {
 		return fmt.Errorf("create checkpoint dir: %w", err)
 	}
 
-	return os.WriteFile(s.checkpointPath, data, 0600)
+	tmpPath := s.checkpointPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("write checkpoint tmp: %w", err)
+	}
+	return os.Rename(tmpPath, s.checkpointPath)
 }
 
 func (s *DeviceState) restoreCheckpoint(logger klog.Logger) error {

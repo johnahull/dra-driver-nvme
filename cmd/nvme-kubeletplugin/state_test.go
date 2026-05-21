@@ -205,6 +205,19 @@ func TestCheckIOMMUGroupSafety(t *testing.T) {
 			wantErr:    true,
 			wantErrMsg: "failed to list IOMMU group",
 		},
+		{
+			name: "co-grouped device driver read returns non-ENOENT error",
+			setup: func(m *mockSysfsOps) {
+				m.links[iommuLink] = "../../../kernel/iommu_groups/42"
+				m.dirs[devicesDir] = []os.DirEntry{
+					fakeDirEntry{name: pciAddr},
+					fakeDirEntry{name: "0000:3b:00.1"},
+				}
+				m.linkErrs["/sys/bus/pci/devices/0000:3b:00.1/driver"] = fmt.Errorf("permission denied")
+			},
+			wantErr:    true,
+			wantErrMsg: "failed to check driver for co-grouped device",
+		},
 	}
 
 	for _, tt := range tests {
