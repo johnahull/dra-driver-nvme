@@ -207,8 +207,11 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 			vfioBound = append(vfioBound, allocDev.Info.PCIAddress)
 
 			if vfio.UseIOMMUFD {
+				vfioGroupPath := fmt.Sprintf("/dev/vfio/%s", vfio.IOMMUGroup)
 				deviceNodes = []*cdispec.DeviceNode{
 					{Path: "/dev/iommu", HostPath: "/dev/iommu", Type: "c"},
+					{Path: "/dev/vfio/vfio", HostPath: "/dev/vfio/vfio", Type: "c"},
+					{Path: vfioGroupPath, HostPath: vfioGroupPath, Type: "c"},
 					{Path: vfio.DevicePath, HostPath: vfio.DevicePath, Type: "c"},
 				}
 			} else {
