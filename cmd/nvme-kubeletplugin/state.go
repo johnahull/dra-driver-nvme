@@ -195,6 +195,13 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		var vfio *vfioResult
 		isVFIO := dwc.config.Mode == "vfio"
 
+		if allocDev.IsNamespaceDevice() && isVFIO {
+			for _, addr := range vfioBound {
+				unprepareVFIO(addr)
+			}
+			return nil, fmt.Errorf("namespace device %s cannot use VFIO mode (use mode=block)", result.Device)
+		}
+
 		if isVFIO {
 			var err error
 			vfio, err = prepareVFIO(allocDev.Info.PCIAddress, dwc.config.Force)
@@ -225,7 +232,15 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 			logger.Info("Prepared NVMe VFIO", "device", result.Device, "claim", claimUID,
 				"pci", allocDev.Info.PCIAddress, "iommuGroup", vfio.IOMMUGroup,
 				"iommufd", vfio.UseIOMMUFD)
+		} else if allocDev.IsNamespaceDevice() {
+			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+				Path: allocDev.Namespace.DevicePath, HostPath: allocDev.Namespace.DevicePath, Type: "b",
+			})
+
+			logger.Info("Prepared NVMe namespace block", "device", result.Device, "claim", claimUID,
+				"namespace", allocDev.Namespace.Name, "pci", allocDev.Info.PCIAddress)
 		} else {
+			// Controller device: expose admin device + all namespaces
 			ctrlPath := fmt.Sprintf("/dev/%s", allocDev.Info.Controller)
 			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
 				Path: ctrlPath, HostPath: ctrlPath, Type: "c",
