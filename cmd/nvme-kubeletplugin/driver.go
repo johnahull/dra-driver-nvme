@@ -26,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
-	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -36,7 +35,7 @@ type driver struct {
 	helper       *kubeletplugin.Helper
 	state        *DeviceState
 	cancelCtx    context.CancelFunc
-	numaAttrForm deviceattribute.AttributeForm
+	numaAttrForm NUMAAttrForm
 }
 
 func NewDriver(ctx context.Context, cancel context.CancelFunc, clientset kubernetes.Interface, f *flags) (*driver, error) {
@@ -80,7 +79,7 @@ func NewDriver(ctx context.Context, cancel context.CancelFunc, clientset kuberne
 	return d, nil
 }
 
-func buildDriverResources(allocatable AllocatableDevices, nodeName string, attrForm deviceattribute.AttributeForm, clientset kubernetes.Interface) resourceslice.DriverResources {
+func buildDriverResources(allocatable AllocatableDevices, nodeName string, attrForm NUMAAttrForm, clientset kubernetes.Interface) resourceslice.DriverResources {
 	sortedNames := allocatable.SortedNames()
 	devices := make([]resourceapi.Device, 0, len(sortedNames))
 	for _, name := range sortedNames {
@@ -223,7 +222,7 @@ func (d *driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 				"resource.kubernetes.io/pciBusID": {StringValue: &pci},
 				"model":                           {StringValue: &model},
 			}
-			numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(pci, d.numaAttrForm)
+			numaAttr, err := getNUMANodeAttribute(pci, d.numaAttrForm)
 			if err == nil {
 				attrs[string(numaAttr.Name)] = numaAttr.Value
 			}

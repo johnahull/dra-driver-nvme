@@ -20,7 +20,6 @@ import (
 	"github.com/johnahull/dra-driver-nvme/pkg/nvme"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/dynamic-resource-allocation/deviceattribute"
 )
 
 func counterInt64(t *testing.T, c resourceapi.Counter) int64 {
@@ -108,7 +107,7 @@ func TestGetSharedCounterSet(t *testing.T) {
 
 func TestGetDeviceController(t *testing.T) {
 	d := &AllocatableDevice{Info: testController()}
-	dev := d.GetDevice("nvme0", deviceattribute.ScalarAttribute)
+	dev := d.GetDevice("nvme0", ScalarNUMAAttr)
 
 	if dev.Name != "nvme0" {
 		t.Errorf("name = %q, want %q", dev.Name, "nvme0")
@@ -138,7 +137,7 @@ func TestGetDeviceController(t *testing.T) {
 func TestGetDeviceNamespace(t *testing.T) {
 	ctrl := testController()
 	d := &AllocatableDevice{Info: ctrl, Namespace: &ctrl.Namespaces[0]}
-	dev := d.GetDevice("nvme0-nvme0n1", deviceattribute.ScalarAttribute)
+	dev := d.GetDevice("nvme0-nvme0n1", ScalarNUMAAttr)
 
 	if dev.Name != "nvme0-nvme0n1" {
 		t.Errorf("name = %q, want %q", dev.Name, "nvme0-nvme0n1")

@@ -19,7 +19,6 @@ import (
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 )
@@ -59,7 +58,7 @@ func (d *AllocatableDevice) GetSharedCounterSet() *resourceapi.CounterSet {
 	}
 }
 
-func (d *AllocatableDevice) controllerTopologyAttrs(attrForm deviceattribute.AttributeForm) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
+func (d *AllocatableDevice) controllerTopologyAttrs(attrForm NUMAAttrForm) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 		"dra.nvme/model":                     {StringValue: ptr.To(d.Info.Model)},
 		"dra.nvme/serial":                    {StringValue: ptr.To(d.Info.Serial)},
@@ -68,7 +67,7 @@ func (d *AllocatableDevice) controllerTopologyAttrs(attrForm deviceattribute.Att
 		"dra.nvme/numaNode":                  {IntValue: ptr.To(int64(d.Info.NUMANode))},
 		"resource.kubernetes.io/cpuSocketID": {IntValue: ptr.To(int64(d.Info.CPUSocketID))},
 	}
-	numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(d.Info.PCIAddress, attrForm)
+	numaAttr, err := getNUMANodeAttribute(d.Info.PCIAddress, attrForm)
 	if err != nil {
 		klog.Warningf("Failed to get numaNode attribute for %s: %v", d.Info.PCIAddress, err)
 	} else {
@@ -88,14 +87,14 @@ func (d *AllocatableDevice) controllerTopologyAttrs(attrForm deviceattribute.Att
 // ConsumesCounters for the entire controller.
 // For namespace devices (Namespace != nil), includes namespace-specific
 // capacity and ConsumesCounters for that namespace's share.
-func (d *AllocatableDevice) GetDevice(name string, attrForm deviceattribute.AttributeForm) resourceapi.Device {
+func (d *AllocatableDevice) GetDevice(name string, attrForm NUMAAttrForm) resourceapi.Device {
 	if d.IsNamespaceDevice() {
 		return d.getNamespaceDevice(name, attrForm)
 	}
 	return d.getControllerDevice(name, attrForm)
 }
 
-func (d *AllocatableDevice) getControllerDevice(name string, attrForm deviceattribute.AttributeForm) resourceapi.Device {
+func (d *AllocatableDevice) getControllerDevice(name string, attrForm NUMAAttrForm) resourceapi.Device {
 	attrs := d.controllerTopologyAttrs(attrForm)
 	totalBytes := d.totalBytes()
 
@@ -120,7 +119,7 @@ func (d *AllocatableDevice) getControllerDevice(name string, attrForm deviceattr
 	return dev
 }
 
-func (d *AllocatableDevice) getNamespaceDevice(name string, attrForm deviceattribute.AttributeForm) resourceapi.Device {
+func (d *AllocatableDevice) getNamespaceDevice(name string, attrForm NUMAAttrForm) resourceapi.Device {
 	attrs := d.controllerTopologyAttrs(attrForm)
 	attrs["dra.nvme/namespaceName"] = resourceapi.DeviceAttribute{StringValue: ptr.To(d.Namespace.Name)}
 	attrs["dra.nvme/controllerName"] = resourceapi.DeviceAttribute{StringValue: ptr.To(d.Info.Controller)}

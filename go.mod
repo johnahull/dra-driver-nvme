@@ -70,11 +70,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-replace (
-	k8s.io/api => /home/jhull/devel/kubernetes/kubernetes/staging/src/k8s.io/api
-	k8s.io/apimachinery => /home/jhull/devel/kubernetes/kubernetes/staging/src/k8s.io/apimachinery
-	k8s.io/client-go => /home/jhull/devel/kubernetes/kubernetes/staging/src/k8s.io/client-go
-	k8s.io/dynamic-resource-allocation => /home/jhull/devel/kubernetes/kubernetes/staging/src/k8s.io/dynamic-resource-allocation
-	k8s.io/kubelet => /home/jhull/devel/kubernetes/kubernetes/staging/src/k8s.io/kubelet
-)
