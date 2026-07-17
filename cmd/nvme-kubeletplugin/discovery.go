@@ -25,6 +25,7 @@ import (
 
 type AllocatableDevice struct {
 	Info         nvme.DeviceInfo
+	Namespace    *nvme.NamespaceInfo // nil = controller device, non-nil = namespace device
 	pciBusIDAttr deviceattribute.DeviceAttribute
 	pcieRootAttr deviceattribute.DeviceAttribute
 }
@@ -62,15 +63,28 @@ func enumerateDevices() (AllocatableDevices, error) {
 			continue
 		}
 
-		name := dev.Controller
-		devices[name] = &AllocatableDevice{
+		ctrlName := dev.Controller
+		devices[ctrlName] = &AllocatableDevice{
 			Info:         dev,
 			pciBusIDAttr: pciBusIDAttr,
 			pcieRootAttr: pcieRootAttr,
 		}
-		klog.InfoS("Registered device",
-			"name", name, "pci", dev.PCIAddress,
-			"numa", dev.NUMANode, "socket", dev.CPUSocketID, "model", dev.Model)
+		klog.InfoS("Registered controller device",
+			"name", ctrlName, "pci", dev.PCIAddress,
+			"numa", dev.NUMANode, "socket", dev.CPUSocketID, "model", dev.Model,
+			"namespaces", len(dev.Namespaces))
+
+		for i := range dev.Namespaces {
+			nsName := fmt.Sprintf("%s-%s", dev.Controller, dev.Namespaces[i].Name)
+			devices[nsName] = &AllocatableDevice{
+				Info:         dev,
+				Namespace:    &dev.Namespaces[i],
+				pciBusIDAttr: pciBusIDAttr,
+				pcieRootAttr: pcieRootAttr,
+			}
+			klog.V(2).InfoS("Registered namespace device",
+				"name", nsName, "size", dev.Namespaces[i].SizeBytes)
+		}
 	}
 
 	klog.InfoS("NVMe discovery complete", "devices", len(devices))

@@ -18,6 +18,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -29,15 +32,16 @@ import (
 )
 
 type driver struct {
-	helper    *kubeletplugin.Helper
-	state     *DeviceState
-	cancelCtx context.CancelFunc
+	helper       *kubeletplugin.Helper
+	state        *DeviceState
+	cancelCtx    context.CancelFunc
+	numaAttrForm NUMAAttrForm
 }
 
 func NewDriver(ctx context.Context, cancel context.CancelFunc, clientset kubernetes.Interface, f *flags) (*driver, error) {
 	logger := klog.FromContext(ctx)
 
-	d := &driver{cancelCtx: cancel}
+	d := &driver{cancelCtx: cancel, numaAttrForm: f.numaAttrForm}
 
 	state, err := NewDeviceState(ctx, f)
 	if err != nil {
@@ -65,28 +69,115 @@ func NewDriver(ctx context.Context, cancel context.CancelFunc, clientset kuberne
 	}
 	d.helper = helper
 
-	sortedNames := state.allocatable.SortedNames()
-	devices := make([]resourceapi.Device, 0, len(sortedNames))
-	for _, name := range sortedNames {
-		devices = append(devices, state.allocatable[name].GetDevice(name))
-	}
-
-	resources := resourceslice.DriverResources{
-		Pools: map[string]resourceslice.Pool{
-			f.nodeName: {
-				Slices: []resourceslice.Slice{
-					{Devices: devices},
-				},
-			},
-		},
-	}
+	resources := buildDriverResources(state.allocatable, f.nodeName, f.numaAttrForm, clientset)
 
 	if err := helper.PublishResources(ctx, resources); err != nil {
 		return nil, fmt.Errorf("error publishing resources: %w", err)
 	}
 
-	logger.Info("Published NVMe devices", "count", len(devices))
+	logger.Info("Published NVMe devices", "allocatable", len(state.allocatable))
 	return d, nil
+}
+
+func buildDriverResources(allocatable AllocatableDevices, nodeName string, attrForm NUMAAttrForm, clientset kubernetes.Interface) resourceslice.DriverResources {
+	sortedNames := allocatable.SortedNames()
+	devices := make([]resourceapi.Device, 0, len(sortedNames))
+	for _, name := range sortedNames {
+		devices = append(devices, allocatable[name].GetDevice(name, attrForm))
+	}
+
+	counterSets, hasCounterSets := collectNVMeCounterSets(allocatable)
+
+	if !hasCounterSets {
+		return resourceslice.DriverResources{
+			Pools: map[string]resourceslice.Pool{
+				nodeName: {
+					Slices: []resourceslice.Slice{
+						{Devices: devices},
+					},
+				},
+			},
+		}
+	}
+
+	useSplit := shouldUseSplitResourceSlices(clientset)
+
+	if useSplit {
+		return resourceslice.DriverResources{
+			Pools: map[string]resourceslice.Pool{
+				nodeName: {
+					Slices: []resourceslice.Slice{
+						{SharedCounters: counterSets},
+						{Devices: devices},
+					},
+				},
+			},
+		}
+	}
+
+	return resourceslice.DriverResources{
+		Pools: map[string]resourceslice.Pool{
+			nodeName: {
+				Slices: []resourceslice.Slice{
+					{
+						SharedCounters: counterSets,
+						Devices:        devices,
+					},
+				},
+			},
+		},
+	}
+}
+
+func collectNVMeCounterSets(allocatable AllocatableDevices) ([]resourceapi.CounterSet, bool) {
+	counterSetsByCtrl := make(map[string]*resourceapi.CounterSet)
+
+	for _, device := range allocatable {
+		ctrlName := device.Info.Controller
+		if _, seen := counterSetsByCtrl[ctrlName]; !seen {
+			cs := device.GetSharedCounterSet()
+			if cs != nil {
+				counterSetsByCtrl[ctrlName] = cs
+			}
+		}
+	}
+
+	if len(counterSetsByCtrl) == 0 {
+		return nil, false
+	}
+
+	ctrlNames := make([]string, 0, len(counterSetsByCtrl))
+	for name := range counterSetsByCtrl {
+		ctrlNames = append(ctrlNames, name)
+	}
+	sort.Strings(ctrlNames)
+
+	result := make([]resourceapi.CounterSet, 0, len(counterSetsByCtrl))
+	for _, name := range ctrlNames {
+		result = append(result, *counterSetsByCtrl[name])
+	}
+	return result, true
+}
+
+func shouldUseSplitResourceSlices(client kubernetes.Interface) bool {
+	v, err := client.Discovery().ServerVersion()
+	if err != nil {
+		klog.Warningf("Failed to detect K8s version for ResourceSlice format; defaulting to split slices: %v", err)
+		return true
+	}
+
+	minor, err := strconv.Atoi(strings.TrimSuffix(v.Minor, "+"))
+	if err != nil {
+		klog.Warningf("Failed to parse K8s minor version %q; defaulting to split slices: %v", v.Minor, err)
+		return true
+	}
+
+	if minor < 35 {
+		klog.V(2).Infof("K8s version %s.%s (< 1.35): using combined ResourceSlices", v.Major, v.Minor)
+		return false
+	}
+	klog.V(2).Infof("K8s version %s.%s (>= 1.35): using split ResourceSlices", v.Major, v.Minor)
+	return true
 }
 
 func (d *driver) Shutdown() {
@@ -126,14 +217,17 @@ func (d *driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 
 		if allocDev, exists := d.state.allocatable[pd.DeviceName]; exists {
 			pci := allocDev.Info.PCIAddress
-			numa := int64(allocDev.Info.NUMANode)
 			model := allocDev.Info.Model
+			attrs := map[string]resourceapi.DeviceAttribute{
+				"resource.kubernetes.io/pciBusID": {StringValue: &pci},
+				"model":                           {StringValue: &model},
+			}
+			numaAttr, err := getNUMANodeAttribute(pci, d.numaAttrForm)
+			if err == nil {
+				attrs[string(numaAttr.Name)] = numaAttr.Value
+			}
 			dev.Metadata = &kubeletplugin.DeviceMetadata{
-				Attributes: map[string]resourceapi.DeviceAttribute{
-					"resource.kubernetes.io/pciBusID": {StringValue: &pci},
-					"numaNode":                        {IntValue: &numa},
-					"model":                           {StringValue: &model},
-				},
+				Attributes: attrs,
 			}
 		}
 
