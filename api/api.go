@@ -32,6 +32,8 @@ const (
 
 var Decoder runtime.Decoder
 
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 // NvmeConfig holds configuration for an NVMe device allocation.
 type NvmeConfig struct {
 	metav1.TypeMeta `json:",inline"`
@@ -40,11 +42,6 @@ type NvmeConfig struct {
 	// "vfio" binds to vfio-pci for VM passthrough.
 	Mode  string `json:"mode,omitempty"`
 	Force bool   `json:"force,omitempty"`
-}
-
-func (c *NvmeConfig) DeepCopyObject() runtime.Object {
-	copy := *c
-	return &copy
 }
 
 func DefaultNvmeConfig() *NvmeConfig {
