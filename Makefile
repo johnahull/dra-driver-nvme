@@ -37,4 +37,5 @@ generate-deepcopy: $(CONTROLLER_GEN)
 		output:object:dir=./api/
 
 $(CONTROLLER_GEN):
+	mkdir -p $(BIN_DIR)
 	GOBIN=$(BIN_DIR) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
