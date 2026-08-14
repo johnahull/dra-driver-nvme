@@ -1,0 +1,15 @@
+ignore:
+  - vendor/
+  - _output/
+  - "*.pb.go"
+  - "zz_generated.*"
+
+rule_settings:
+  enable: [default]
+  rule_types:
+    - refactoring
+    - suggestion
+    - comment
+
+metrics:
+  quality_threshold: 25.0

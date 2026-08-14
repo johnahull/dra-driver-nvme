@@ -23,6 +23,7 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -32,22 +33,33 @@ const (
 
 type flags struct {
 	nodeName                      string
+	kubeconfig                    string
 	kubeletRegistrarDirectoryPath string
 	pluginDataDirectoryPath       string
 	cdiRoot                       string
+	numaAttrForm                  NUMAAttrForm
 }
 
 func main() {
 	klog.InitFlags(nil)
 
 	f := &flags{}
+	var numaList bool
 	flag.StringVar(&f.nodeName, "node-name", "", "Node name (required)")
+	flag.StringVar(&f.kubeconfig, "kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if empty)")
 	flag.StringVar(&f.kubeletRegistrarDirectoryPath, "kubelet-registrar-path",
 		"/var/lib/kubelet/plugins_registry", "Kubelet plugin registrar directory")
 	flag.StringVar(&f.pluginDataDirectoryPath, "plugin-data-path",
 		"/var/lib/kubelet/plugins/dra.nvme", "Plugin data directory")
 	flag.StringVar(&f.cdiRoot, "cdi-root", "/var/run/cdi", "CDI spec directory")
+	flag.BoolVar(&numaList, "numa-list", true, "Publish numaNode as SLIT-based list (true) or scalar (false)")
 	flag.Parse()
+
+	if numaList {
+		f.numaAttrForm = ListNUMAAttr
+	} else {
+		f.numaAttrForm = ScalarNUMAAttr
+	}
 
 	if f.nodeName == "" {
 		f.nodeName = os.Getenv("NODE_NAME")
@@ -56,9 +68,15 @@ func main() {
 		klog.Fatal("--node-name or NODE_NAME is required")
 	}
 
-	config, err := rest.InClusterConfig()
+	var config *rest.Config
+	var err error
+	if f.kubeconfig != "" {
+		config, err = clientcmd.BuildConfigFromFlags("", f.kubeconfig)
+	} else {
+		config, err = rest.InClusterConfig()
+	}
 	if err != nil {
-		klog.Fatalf("Failed to get in-cluster config: %v", err)
+		klog.Fatalf("Failed to get kube config: %v", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
