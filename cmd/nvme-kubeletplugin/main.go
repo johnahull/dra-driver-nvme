@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/klog/v2"
 )
 
@@ -37,7 +38,7 @@ type flags struct {
 	kubeletRegistrarDirectoryPath string
 	pluginDataDirectoryPath       string
 	cdiRoot                       string
-	numaAttrForm                  NUMAAttrForm
+	numaAttrForm                  deviceattribute.AttributeForm
 }
 
 func main() {
@@ -56,9 +57,9 @@ func main() {
 	flag.Parse()
 
 	if numaList {
-		f.numaAttrForm = ListNUMAAttr
+		f.numaAttrForm = deviceattribute.ListAttribute
 	} else {
-		f.numaAttrForm = ScalarNUMAAttr
+		f.numaAttrForm = deviceattribute.ScalarAttribute
 	}
 
 	if f.nodeName == "" {
