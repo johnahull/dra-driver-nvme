@@ -44,7 +44,6 @@ func testController() nvme.DeviceInfo {
 		Controller:  "nvme0",
 		PCIAddress:  "0000:3b:00.0",
 		NUMANode:    0,
-		CPUSocketID: 0,
 		Model:       "Samsung_SSD_990",
 		Serial:      "S123",
 		FirmwareRev: "1.0",

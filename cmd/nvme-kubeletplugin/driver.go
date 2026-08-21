@@ -31,6 +31,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 )
 
 type driver struct {
@@ -197,6 +198,40 @@ func (d *driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 	return result, nil
 }
 
+func (d *driver) buildDeviceMetadata(allocDev *AllocatableDevice) map[string]resourceapi.DeviceAttribute {
+	attrs := map[string]resourceapi.DeviceAttribute{
+		"dra.nvme/model":       {StringValue: &allocDev.Info.Model},
+		"dra.nvme/serial":      {StringValue: &allocDev.Info.Serial},
+		"dra.nvme/firmwareRev": {StringValue: &allocDev.Info.FirmwareRev},
+		"dra.nvme/transport":   {StringValue: &allocDev.Info.Transport},
+		"dra.nvme/numaNode":    {IntValue: ptr.To(int64(allocDev.Info.NUMANode))},
+	}
+
+	// Add upstream standardized attributes (use pre-validated helpers from AllocatableDevice)
+	if allocDev.pciBusIDAttr.Name != "" {
+		attrs[string(allocDev.pciBusIDAttr.Name)] = allocDev.pciBusIDAttr.Value
+	}
+
+	numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(allocDev.Info.PCIAddress, d.numaAttrForm)
+	if err == nil {
+		attrs[string(numaAttr.Name)] = numaAttr.Value
+	}
+
+	if allocDev.pcieRootAttr.Name != "" {
+		attrs[string(allocDev.pcieRootAttr.Name)] = allocDev.pcieRootAttr.Value
+	}
+
+	// Add namespace-specific attributes for namespace devices
+	if allocDev.IsNamespaceDevice() {
+		nsName := allocDev.Namespace.Name
+		ctrlName := allocDev.Info.Controller
+		attrs["dra.nvme/namespaceName"] = resourceapi.DeviceAttribute{StringValue: &nsName}
+		attrs["dra.nvme/controllerName"] = resourceapi.DeviceAttribute{StringValue: &ctrlName}
+	}
+
+	return attrs
+}
+
 func (d *driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	logger := klog.FromContext(ctx)
 
@@ -217,18 +252,8 @@ func (d *driver) prepareClaim(ctx context.Context, claim *resourceapi.ResourceCl
 		}
 
 		if allocDev, exists := d.state.allocatable[pd.DeviceName]; exists {
-			pci := allocDev.Info.PCIAddress
-			model := allocDev.Info.Model
-			attrs := map[string]resourceapi.DeviceAttribute{
-				"resource.kubernetes.io/pciBusID": {StringValue: &pci},
-				"model":                           {StringValue: &model},
-			}
-			numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(pci, d.numaAttrForm)
-			if err == nil {
-				attrs[string(numaAttr.Name)] = numaAttr.Value
-			}
 			dev.Metadata = &kubeletplugin.DeviceMetadata{
-				Attributes: attrs,
+				Attributes: d.buildDeviceMetadata(allocDev),
 			}
 		}
 

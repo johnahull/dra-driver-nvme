@@ -61,12 +61,11 @@ func (d *AllocatableDevice) GetSharedCounterSet() *resourceapi.CounterSet {
 
 func (d *AllocatableDevice) controllerTopologyAttrs(attrForm deviceattribute.AttributeForm) map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-		"dra.nvme/model":                     {StringValue: ptr.To(d.Info.Model)},
-		"dra.nvme/serial":                    {StringValue: ptr.To(d.Info.Serial)},
-		"dra.nvme/firmwareRev":               {StringValue: ptr.To(d.Info.FirmwareRev)},
-		"dra.nvme/transport":                 {StringValue: ptr.To(d.Info.Transport)},
-		"dra.nvme/numaNode":                  {IntValue: ptr.To(int64(d.Info.NUMANode))},
-		"resource.kubernetes.io/cpuSocketID": {IntValue: ptr.To(int64(d.Info.CPUSocketID))},
+		"dra.nvme/model":       {StringValue: ptr.To(d.Info.Model)},
+		"dra.nvme/serial":      {StringValue: ptr.To(d.Info.Serial)},
+		"dra.nvme/firmwareRev": {StringValue: ptr.To(d.Info.FirmwareRev)},
+		"dra.nvme/transport":   {StringValue: ptr.To(d.Info.Transport)},
+		"dra.nvme/numaNode":    {IntValue: ptr.To(int64(d.Info.NUMANode))},
 	}
 	numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(d.Info.PCIAddress, attrForm)
 	if err != nil {
