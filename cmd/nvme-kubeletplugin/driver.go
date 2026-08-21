@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -39,12 +40,13 @@ type driver struct {
 	state        *DeviceState
 	cancelCtx    context.CancelFunc
 	numaAttrForm deviceattribute.AttributeForm
+	nodeName     string
 }
 
 func NewDriver(ctx context.Context, cancel context.CancelFunc, clientset kubernetes.Interface, f *flags) (*driver, error) {
 	logger := klog.FromContext(ctx)
 
-	d := &driver{cancelCtx: cancel, numaAttrForm: f.numaAttrForm}
+	d := &driver{cancelCtx: cancel, numaAttrForm: f.numaAttrForm, nodeName: f.nodeName}
 
 	state, err := NewDeviceState(ctx, f)
 	if err != nil {
@@ -276,13 +278,16 @@ func (d *driver) UnprepareResourceClaims(ctx context.Context, claims []kubeletpl
 	return result, nil
 }
 
+// HandleError is invoked by the kubeletplugin helper on gRPC server failures,
+// ResourceSlice publish errors, and health-report staleness. Errors wrapping
+// kubeletplugin.ErrRecoverable (e.g. a transient ResourceSlice publish failure
+// or a stale health report) are logged and otherwise ignored — the helper will
+// retry on its own. Any other error is treated as fatal and shuts the driver down.
 func (d *driver) HandleError(ctx context.Context, err error, msg string) {
 	logger := klog.FromContext(ctx)
 	logger.Error(err, msg)
+	if errors.Is(err, kubeletplugin.ErrRecoverable) {
+		return
+	}
 	d.cancelCtx()
-}
-
-func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
-	// Health reporting is not supported by this driver
-	return kubeletplugin.ErrHealthNotSupported
 }
