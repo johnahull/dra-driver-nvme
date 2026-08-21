@@ -32,8 +32,6 @@ type DeviceInfo struct {
 	PCIAddress string
 	// NUMA node
 	NUMANode int
-	// CPU socket ID (physical package)
-	CPUSocketID int
 	// Model name
 	Model string
 	// Serial number
@@ -95,14 +93,10 @@ func Discover() ([]DeviceInfo, error) {
 		firmwareRev := readStringFile(filepath.Join(ctrlPath, "firmware_rev"))
 		transport := readStringFile(filepath.Join(ctrlPath, "transport"))
 
-		// Derive CPU socket ID from NUMA node
-		cpuSocketID := getSocketIDForNUMA(numaNode)
-
 		dev := DeviceInfo{
 			Controller:  ctrlName,
 			PCIAddress:  pciAddr,
 			NUMANode:    numaNode,
-			CPUSocketID: cpuSocketID,
 			Model:       sanitize(model),
 			Serial:      sanitize(serial),
 			FirmwareRev: sanitize(firmwareRev),
@@ -214,21 +208,4 @@ func hasMountedNamespace(namespaces []NamespaceInfo) bool {
 		}
 	}
 	return false
-}
-
-// getSocketIDForNUMA derives the CPU physical_package_id (socket) for a NUMA node
-// by reading the socket ID of the first CPU on that NUMA node.
-func getSocketIDForNUMA(numaNode int) int {
-	cpuListPath := fmt.Sprintf("/sys/devices/system/node/node%d/cpulist", numaNode)
-	cpuList := readStringFile(cpuListPath)
-	if cpuList == "" {
-		return 0
-	}
-	// Parse first CPU from the list (e.g., "0,2,4,6" or "0-31")
-	firstCPU := cpuList
-	if idx := strings.IndexAny(cpuList, ",-"); idx > 0 {
-		firstCPU = cpuList[:idx]
-	}
-	socketPath := fmt.Sprintf("/sys/devices/system/cpu/cpu%s/topology/physical_package_id", firstCPU)
-	return readIntFile(socketPath, 0)
 }

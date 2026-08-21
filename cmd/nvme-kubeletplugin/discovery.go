@@ -71,7 +71,7 @@ func enumerateDevices() (AllocatableDevices, error) {
 		}
 		klog.InfoS("Registered controller device",
 			"name", ctrlName, "pci", dev.PCIAddress,
-			"numa", dev.NUMANode, "socket", dev.CPUSocketID, "model", dev.Model,
+			"numa", dev.NUMANode, "model", dev.Model,
 			"namespaces", len(dev.Namespaces))
 
 		for i := range dev.Namespaces {
