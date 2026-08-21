@@ -37,6 +37,8 @@ type mockSysfsOps struct {
 	stats     map[string]bool
 	writeErrs map[string]error
 	writes    []writeCall
+	files     map[string][]byte
+	fileErrs  map[string]error
 }
 
 func newMockSysfs() *mockSysfsOps {
@@ -47,6 +49,8 @@ func newMockSysfs() *mockSysfsOps {
 		dirErrs:   make(map[string]error),
 		stats:     make(map[string]bool),
 		writeErrs: make(map[string]error),
+		files:     make(map[string][]byte),
+		fileErrs:  make(map[string]error),
 	}
 }
 
@@ -74,6 +78,16 @@ func (m *mockSysfsOps) ReadDir(path string) ([]os.DirEntry, error) {
 	}
 	if entries, ok := m.dirs[path]; ok {
 		return entries, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func (m *mockSysfsOps) ReadFile(path string) ([]byte, error) {
+	if err, ok := m.fileErrs[path]; ok {
+		return nil, err
+	}
+	if data, ok := m.files[path]; ok {
+		return data, nil
 	}
 	return nil, os.ErrNotExist
 }

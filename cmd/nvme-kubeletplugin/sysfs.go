@@ -23,6 +23,7 @@ type SysfsOps interface {
 	ReadLink(path string) (string, error)
 	WriteFile(path string, data []byte, perm fs.FileMode) error
 	ReadDir(path string) ([]os.DirEntry, error)
+	ReadFile(path string) ([]byte, error)
 	Stat(path string) (fs.FileInfo, error)
 }
 
@@ -33,6 +34,7 @@ func (realSysfsOps) WriteFile(path string, data []byte, perm fs.FileMode) error 
 	return os.WriteFile(path, data, perm)
 }
 func (realSysfsOps) ReadDir(path string) ([]os.DirEntry, error) { return os.ReadDir(path) }
+func (realSysfsOps) ReadFile(path string) ([]byte, error)       { return os.ReadFile(path) }
 func (realSysfsOps) Stat(path string) (fs.FileInfo, error)      { return os.Stat(path) }
 
 var sysfs SysfsOps = realSysfsOps{}
