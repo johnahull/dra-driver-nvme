@@ -8,7 +8,7 @@ A Kubernetes [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/conc
 - **Standardized topology attributes** — publishes `resource.kubernetes.io/numaNode`, `pciBusID`, and `pcieRoot` for cross-driver NUMA alignment via DRA `matchAttribute` constraints
 - **Block device mode** (default) — exposes `/dev/nvme*n*` block devices to pods via CDI
 - **VFIO passthrough mode** — binds NVMe controllers to `vfio-pci` for direct VM passthrough via KubeVirt
-- **Device metadata (KEP-5304)** — publishes `pciBusID` metadata for KubeVirt guest topology placement
+- **Device metadata (KEP-5304)** — publishes runtime device metadata including topology (`pciBusID`, `numaNode`, `pcieRoot`) and device attributes (`model`, `serial`, `firmwareRev`, `transport`) for workload-level device awareness and KubeVirt guest topology placement
 
 ## Published Attributes
 
