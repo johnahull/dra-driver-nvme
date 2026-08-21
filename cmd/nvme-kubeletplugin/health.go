@@ -26,8 +26,9 @@ import (
 
 // healthPollInterval must stay below the kubelet's default 30s health-report
 // lease (kubeletplugin.DeviceHealth.HealthCheckTimeout, zero value) so health
-// never decays to Unknown between polls.
-const healthPollInterval = 15 * time.Second
+// never decays to Unknown between polls. Var (not const) so tests can shrink
+// it to exercise the periodic re-send path.
+var healthPollInterval = 15 * time.Second
 
 const (
 	nvmeStatePathFmt = "/sys/class/nvme/%s/state"
@@ -49,7 +50,8 @@ func controllerHealth(controller, pciAddr string) (kubeletplugin.HealthStatus, s
 			}
 			return kubeletplugin.HealthStatusUnhealthy, "device removed"
 		}
-		// A non-NotExist read error (e.g. EIO) is itself a failing-device signal.
+		// A non-NotExist read error (e.g. EIO) is ambiguous — report Unknown
+		// rather than guessing the device has failed.
 		return kubeletplugin.HealthStatusUnknown, fmt.Sprintf("failed to read controller state: %v", err)
 	}
 
@@ -118,8 +120,9 @@ func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletpl
 	defer ticker.Stop()
 
 	send := func() bool {
+		report := d.buildHealthReport()
 		select {
-		case reports <- d.buildHealthReport():
+		case reports <- report:
 			return true
 		case <-ctx.Done():
 			return false
