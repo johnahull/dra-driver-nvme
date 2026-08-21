@@ -5,7 +5,7 @@ A Kubernetes [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/conc
 ## Features
 
 - **NVMe discovery from sysfs** — enumerates all PCIe-attached NVMe controllers and their namespaces
-- **Standardized topology attributes** — publishes `resource.kubernetes.io/numaNode`, `cpuSocketID`, `pciBusID`, and `pcieRoot` for cross-driver NUMA alignment via DRA `matchAttribute` constraints
+- **Standardized topology attributes** — publishes `resource.kubernetes.io/numaNode`, `pciBusID`, and `pcieRoot` for cross-driver NUMA alignment via DRA `matchAttribute` constraints
 - **Block device mode** (default) — exposes `/dev/nvme*n*` block devices to pods via CDI
 - **VFIO passthrough mode** — binds NVMe controllers to `vfio-pci` for direct VM passthrough via KubeVirt
 - **Device metadata (KEP-5304)** — publishes `pciBusID` metadata for KubeVirt guest topology placement
@@ -17,7 +17,6 @@ Each NVMe device is published as a ResourceSlice with these attributes:
 | Attribute | Type | Example | Description |
 |-----------|------|---------|-------------|
 | `resource.kubernetes.io/numaNode` | int | `0` | Host NUMA node |
-| `resource.kubernetes.io/cpuSocketID` | int | `0` | CPU socket ID |
 | `resource.kubernetes.io/pciBusID` | string | `0000:3b:00.0` | PCI bus address |
 | `resource.kubernetes.io/pcieRoot` | string | `pci0000:36` | PCIe root complex |
 | `dra.nvme/numaNode` | int | `0` | NUMA node (vendor-specific) |

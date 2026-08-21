@@ -199,24 +199,24 @@ func (d *driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 }
 
 func (d *driver) buildDeviceMetadata(allocDev *AllocatableDevice) map[string]resourceapi.DeviceAttribute {
-	pci := allocDev.Info.PCIAddress
-
 	attrs := map[string]resourceapi.DeviceAttribute{
-		"resource.kubernetes.io/pciBusID": {StringValue: &pci},
-		"dra.nvme/model":                  {StringValue: &allocDev.Info.Model},
-		"dra.nvme/serial":                 {StringValue: &allocDev.Info.Serial},
-		"dra.nvme/firmwareRev":            {StringValue: &allocDev.Info.FirmwareRev},
-		"dra.nvme/transport":              {StringValue: &allocDev.Info.Transport},
-		"dra.nvme/numaNode":               {IntValue: ptr.To(int64(allocDev.Info.NUMANode))},
+		"dra.nvme/model":       {StringValue: &allocDev.Info.Model},
+		"dra.nvme/serial":      {StringValue: &allocDev.Info.Serial},
+		"dra.nvme/firmwareRev": {StringValue: &allocDev.Info.FirmwareRev},
+		"dra.nvme/transport":   {StringValue: &allocDev.Info.Transport},
+		"dra.nvme/numaNode":    {IntValue: ptr.To(int64(allocDev.Info.NUMANode))},
 	}
 
-	// Add upstream standardized NUMA attribute (list or scalar based on --numa-list flag)
-	numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(pci, d.numaAttrForm)
+	// Add upstream standardized attributes (use pre-validated helpers from AllocatableDevice)
+	if allocDev.pciBusIDAttr.Name != "" {
+		attrs[string(allocDev.pciBusIDAttr.Name)] = allocDev.pciBusIDAttr.Value
+	}
+
+	numaAttr, err := deviceattribute.GetNUMANodeAttributeByPCIBusID(allocDev.Info.PCIAddress, d.numaAttrForm)
 	if err == nil {
 		attrs[string(numaAttr.Name)] = numaAttr.Value
 	}
 
-	// Add PCIe root attribute
 	if allocDev.pcieRootAttr.Name != "" {
 		attrs[string(allocDev.pcieRootAttr.Name)] = allocDev.pcieRootAttr.Value
 	}
