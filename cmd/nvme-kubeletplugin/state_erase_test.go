@@ -22,6 +22,7 @@ import (
 	"time"
 
 	nvmeapi "github.com/johnahull/dra-driver-nvme/api"
+	"github.com/johnahull/dra-driver-nvme/pkg/nvme"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -174,11 +175,20 @@ func TestUnprepareFailClosedOnEraseFailure(t *testing.T) {
 		t.Error("unpreparing guard should be cleared after failure so a retry can proceed")
 	}
 
-	// Retry should attempt erase again (idempotent), and succeed once the
-	// failure is cleared.
+	if len(runner.calls) != 1 {
+		t.Fatalf("got %d nvme calls before retry, want 1 (should stop at the first failing namespace)", len(runner.calls))
+	}
+
+	// Retry should attempt erase again (idempotent) for BOTH namespaces
+	// (retry restarts the device's erase loop from the top), and succeed
+	// once the failure is cleared.
 	runner.errFor = nil
 	if err := s.Unprepare(t.Context(), "uid1"); err != nil {
 		t.Fatalf("retry Unprepare() = %v, want nil", err)
+	}
+	if len(runner.calls) != 3 {
+		t.Errorf("got %d total nvme calls after retry, want 3 (1 failed + 2 re-attempted on retry) — "+
+			"proves the retry actually re-ran erase rather than just clearing state", len(runner.calls))
 	}
 	if _, ok := s.prepared["uid1"]; ok {
 		t.Error("claim should be removed from prepared map after successful erase")
@@ -229,6 +239,48 @@ func TestUnprepareWithoutSecureEraseSkipsErase(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Errorf("got %d nvme calls, want 0 (secure erase not requested)", len(runner.calls))
+	}
+}
+
+func TestUnprepareMixedSecureEraseFlags(t *testing.T) {
+	withShrunkDevicePresenceTiming(t)
+
+	ctrl0 := testController()
+	ctrl1 := testController()
+	ctrl1.Controller = "nvme1"
+	ctrl1.PCIAddress = "0000:3c:00.0"
+	ctrl1.Namespaces = []nvme.NamespaceInfo{{Name: "nvme1n1", DevicePath: "/dev/nvme1n1", SizeBytes: 1024}}
+
+	m := newMockSysfs()
+	m.stats["/dev/nvme0n1"] = true
+	m.stats["/dev/nvme0n2"] = true
+	m.stats["/dev/nvme1n1"] = true
+	withMockSysfs(t, m)
+
+	runner := &fakeCommandRunner{}
+	withFakeCommandRunner(t, runner)
+
+	s := newTestDeviceStateWithController(t, true)
+	s.allocatable[ctrl1.Controller] = &AllocatableDevice{Info: ctrl1}
+	s.prepared["uid1"] = []*PreparedNvme{
+		{Device: drapbv1.Device{DeviceName: ctrl0.Controller, PoolName: "test-node"}, SecureErase: true},
+		{Device: drapbv1.Device{DeviceName: ctrl1.Controller, PoolName: "test-node"}, SecureErase: false},
+	}
+
+	if err := s.Unprepare(t.Context(), "uid1"); err != nil {
+		t.Fatalf("Unprepare() = %v, want nil", err)
+	}
+	if _, ok := s.prepared["uid1"]; ok {
+		t.Error("claim should be removed from prepared map")
+	}
+	// Only nvme0's 2 namespaces should be erased; nvme1 opted out.
+	if len(runner.calls) != 2 {
+		t.Fatalf("got %d nvme calls, want 2 (only the SecureErase=true device's namespaces)", len(runner.calls))
+	}
+	for _, c := range runner.calls {
+		if c.args[1] == "/dev/nvme1n1" {
+			t.Errorf("nvme1n1 should not have been erased (SecureErase=false on that device): %+v", c)
+		}
 	}
 }
 

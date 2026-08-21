@@ -88,7 +88,11 @@ func waitForDevicePath(ctx context.Context, path string) error {
 // kubelet may cancel that RPC's context on its own timeout, and killing an
 // in-progress format command mid-flight would leave the device in a worse,
 // indeterminate state than not starting the erase at all. Callers still block
-// on this function's return before responding to the RPC.
+// on this function's return before responding to the RPC. Note this only
+// decouples erase from the RPC's cancellation, not from all cancellation:
+// baseCtx is itself canceled on driver shutdown (SIGTERM), so a node drain
+// mid-erase can still interrupt an in-progress format command — an accepted,
+// unavoidable tradeoff since the process is exiting regardless.
 func secureErase(ctx context.Context, devicePaths []string) error {
 	for _, path := range devicePaths {
 		if err := waitForDevicePath(ctx, path); err != nil {

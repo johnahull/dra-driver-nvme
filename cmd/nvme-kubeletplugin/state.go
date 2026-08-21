@@ -358,8 +358,20 @@ func (s *DeviceState) eraseDevicePaths(deviceName string) ([]string, error) {
 // The prepared-claim map entry is deleted only after all teardown work
 // (VFIO rebind, secure erase) succeeds. This ordering is required for
 // fail-closed secure erase: if erase fails and this returns an error while
-// the map entry were already gone, a kubelet retry would find nothing to
+// the map entry was already gone, a kubelet retry would find nothing to
 // retry and silently "succeed" without ever erasing.
+//
+// Note: this only honors each device's persisted PreparedNvme.SecureErase —
+// it does NOT re-check s.secureEraseEnabled. This is intentional: once a
+// claim has been accepted with a promise to erase, turning the driver-level
+// flag off later must never silently cause that promise to be dropped.
+//
+// If a multi-device claim's erase loop fails partway through (e.g. device 2
+// of 3), a retry re-erases all of that claim's SecureErase devices again,
+// including ones that already succeeded. This is intentional, not a bug:
+// crypto erase is idempotent and near-instant, so redundant re-erasure is
+// cheap, and it keeps the retry logic simple (no partial-completion state to
+// track).
 func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 	logger := klog.FromContext(ctx)
 
@@ -376,6 +388,16 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 	s.unpreparing[claimUID] = true
 	s.mu.Unlock()
 
+	succeeded := false
+	defer func() {
+		s.mu.Lock()
+		delete(s.unpreparing, claimUID)
+		if succeeded {
+			delete(s.prepared, claimUID)
+		}
+		s.mu.Unlock()
+	}()
+
 	for _, dev := range devices {
 		if dev.IsVFIO && dev.PCIAddress != "" {
 			unprepareVFIO(dev.PCIAddress)
@@ -388,26 +410,17 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 		}
 		paths, err := s.eraseDevicePaths(dev.DeviceName)
 		if err != nil {
-			s.mu.Lock()
-			delete(s.unpreparing, claimUID)
-			s.mu.Unlock()
 			return fmt.Errorf("resolving erase targets for claim %s device %s: %w", claimUID, dev.DeviceName, err)
 		}
 		// secureErase uses s.baseCtx (driver-lifetime), not ctx (this RPC's
 		// context) — see the doc comment on secureErase for why.
 		if err := secureErase(s.baseCtx, paths); err != nil {
-			s.mu.Lock()
-			delete(s.unpreparing, claimUID)
-			s.mu.Unlock()
 			return fmt.Errorf("secure erase failed for claim %s device %s: %w", claimUID, dev.DeviceName, err)
 		}
 		logger.Info("Secure erase complete", "claim", claimUID, "device", dev.DeviceName, "paths", paths)
 	}
 
-	s.mu.Lock()
-	delete(s.prepared, claimUID)
-	delete(s.unpreparing, claimUID)
-	s.mu.Unlock()
+	succeeded = true
 
 	specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 	if err := s.cdiCache.RemoveSpec(specName); err != nil {
