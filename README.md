@@ -16,7 +16,7 @@ Each NVMe device is published as a ResourceSlice with these attributes:
 
 | Attribute | Type | Example | Description |
 |-----------|------|---------|-------------|
-| `resource.kubernetes.io/numaNode` | int | `0` | Host NUMA node |
+| `resource.kubernetes.io/numaNode` | int list (default) or int | `[0, 1]` | Host NUMA node(s); a SLIT-based list by default, or a scalar with `--numa-list=false` (see [Configuration](#configuration)) |
 | `resource.kubernetes.io/pciBusID` | string | `0000:3b:00.0` | PCI bus address |
 | `resource.kubernetes.io/pcieRoot` | string | `pci0000:36` | PCIe root complex |
 | `dra.nvme/numaNode` | int | `0` | NUMA node (vendor-specific) |
