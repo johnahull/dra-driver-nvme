@@ -22,8 +22,14 @@ Each NVMe device is published as a ResourceSlice with these attributes:
 | `dra.nvme/numaNode` | int | `0` | NUMA node (vendor-specific) |
 | `dra.nvme/model` | string | `SAMSUNG MZQL21T9HCJR` | Device model |
 | `dra.nvme/serial` | string | `S64GNE...` | Serial number |
+| `dra.nvme/firmwareRev` | string | `GDC5302Q` | Firmware revision |
 | `dra.nvme/transport` | string | `pcie` | Transport type |
-| `dra.nvme/namespaceCount` | int | `1` | Number of namespaces |
+| `dra.nvme/namespaceName` * | string | `nvme0n1` | Namespace name (namespace devices only) |
+| `dra.nvme/controllerName` * | string | `nvme0` | Parent controller name (namespace devices only) |
+
+\* Namespace-only attributes are set when the device represents an individual
+NVMe namespace rather than a whole controller. Each device also has a
+`dra.nvme/size` capacity (bytes) used for KEP-4815 shared counter accounting.
 
 ## Quick Start
 
@@ -118,8 +124,22 @@ podman build -t dra-driver-nvme:latest .
 cmd/nvme-kubeletplugin/    # DRA kubelet plugin entrypoint
 pkg/nvme/                  # NVMe sysfs discovery
 api/                       # NvmeConfig API types (block/vfio mode selection)
-deploy/                    # Kubernetes manifests (DaemonSet, DeviceClass, RBAC)
+deploy/                    # Kubernetes manifests (DaemonSet, DeviceClass, RBAC, Helm chart)
+test/e2e/                  # End-to-end tests
 ```
+
+## Configuration
+
+Driver flags (set via the DaemonSet container args):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--node-name` | *(required, or `$NODE_NAME`)* | Node this instance runs on |
+| `--kubeconfig` | *(in-cluster config)* | Path to kubeconfig, for out-of-cluster testing |
+| `--kubelet-registrar-path` | `/var/lib/kubelet/plugins_registry` | Kubelet plugin registrar directory |
+| `--plugin-data-path` | `/var/lib/kubelet/plugins/dra.nvme` | Plugin data/checkpoint directory |
+| `--cdi-root` | `/var/run/cdi` | CDI spec output directory |
+| `--numa-list` | `true` | Publish `numaNode` as a SLIT-based list (`true`) or a scalar (`false`) |
 
 ## Related Projects
 
