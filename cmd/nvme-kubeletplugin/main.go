@@ -39,6 +39,7 @@ type flags struct {
 	pluginDataDirectoryPath       string
 	cdiRoot                       string
 	numaAttrForm                  deviceattribute.AttributeForm
+	secureEraseEnabled            bool
 }
 
 func main() {
@@ -54,6 +55,8 @@ func main() {
 		"/var/lib/kubelet/plugins/dra.nvme", "Plugin data directory")
 	flag.StringVar(&f.cdiRoot, "cdi-root", "/var/run/cdi", "CDI spec directory")
 	flag.BoolVar(&numaList, "numa-list", true, "Publish numaNode as SLIT-based list (true) or scalar (false)")
+	flag.BoolVar(&f.secureEraseEnabled, "enable-secure-erase", false,
+		"Allow claims to request NVMe cryptographic erase on release (opt-in per claim via NvmeConfig.secureErase)")
 	flag.Parse()
 
 	if numaList {

@@ -42,6 +42,10 @@ type NvmeConfig struct {
 	// "vfio" binds to vfio-pci for VM passthrough.
 	Mode  string `json:"mode,omitempty"`
 	Force bool   `json:"force,omitempty"`
+	// SecureErase requests an NVMe cryptographic erase of the device on
+	// release. Requires the driver to be started with --enable-secure-erase;
+	// otherwise the claim is rejected at Prepare time.
+	SecureErase bool `json:"secureErase,omitempty"`
 }
 
 func DefaultNvmeConfig() *NvmeConfig {

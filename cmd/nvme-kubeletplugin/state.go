@@ -42,19 +42,26 @@ const (
 )
 
 type DeviceState struct {
-	mu             sync.Mutex
-	allocatable    AllocatableDevices // immutable after initialization
-	prepared       map[string][]*PreparedNvme
-	preparing      map[string]bool
-	cdiCache       *cdiapi.Cache
-	checkpointPath string
+	mu                 sync.Mutex
+	allocatable        AllocatableDevices // immutable after initialization
+	prepared           map[string][]*PreparedNvme
+	preparing          map[string]bool
+	unpreparing        map[string]bool
+	cdiCache           *cdiapi.Cache
+	checkpointPath     string
+	secureEraseEnabled bool
+	// baseCtx is the driver's long-lived lifetime context (canceled only on
+	// shutdown), used for operations like secure erase that must not be
+	// aborted just because a single gRPC call's context was canceled.
+	baseCtx context.Context
 }
 
 type PreparedNvme struct {
 	drapbv1.Device
-	IsVFIO     bool   `json:"isVFIO"`
-	PCIAddress string `json:"pciAddress"`
-	UseIOMMUFD bool   `json:"useIOMMUFD,omitempty"`
+	IsVFIO      bool   `json:"isVFIO"`
+	PCIAddress  string `json:"pciAddress"`
+	UseIOMMUFD  bool   `json:"useIOMMUFD,omitempty"`
+	SecureErase bool   `json:"secureErase,omitempty"`
 }
 
 type vfioResult struct {
@@ -84,11 +91,14 @@ func NewDeviceState(ctx context.Context, f *flags) (*DeviceState, error) {
 	checkpointPath := filepath.Join(f.pluginDataDirectoryPath, checkpointFile)
 
 	s := &DeviceState{
-		allocatable:    allocatable,
-		prepared:       make(map[string][]*PreparedNvme),
-		preparing:      make(map[string]bool),
-		cdiCache:       cache,
-		checkpointPath: checkpointPath,
+		allocatable:        allocatable,
+		prepared:           make(map[string][]*PreparedNvme),
+		preparing:          make(map[string]bool),
+		unpreparing:        make(map[string]bool),
+		cdiCache:           cache,
+		checkpointPath:     checkpointPath,
+		secureEraseEnabled: f.secureEraseEnabled,
+		baseCtx:            ctx,
 	}
 
 	if err := s.restoreCheckpoint(logger); err != nil {
@@ -103,13 +113,13 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	claimUID := string(claim.UID)
 
 	s.mu.Lock()
-	if existing, ok := s.prepared[claimUID]; ok {
+	if existing, ok := s.prepared[claimUID]; ok && !s.unpreparing[claimUID] {
 		s.mu.Unlock()
 		return existing, nil
 	}
-	if s.preparing[claimUID] {
+	if s.preparing[claimUID] || s.unpreparing[claimUID] {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("claim %s is already being prepared", claimUID)
+		return nil, fmt.Errorf("claim %s is already being prepared or unprepared", claimUID)
 	}
 	s.preparing[claimUID] = true
 	s.mu.Unlock()
@@ -170,6 +180,10 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		if err := matchedConfig.Validate(); err != nil {
 			s.mu.Unlock()
 			return nil, fmt.Errorf("error validating config for %s: %w", result.Device, err)
+		}
+		if matchedConfig.SecureErase && !s.secureEraseEnabled {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("device %s requests secureErase but the driver was not started with --enable-secure-erase", result.Device)
 		}
 
 		resultCopy := result
@@ -269,8 +283,9 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 				DeviceName:   result.Device,
 				CdiDeviceIds: []string{cdiDeviceID},
 			},
-			IsVFIO:     isVFIO,
-			PCIAddress: allocDev.Info.PCIAddress,
+			IsVFIO:      isVFIO,
+			PCIAddress:  allocDev.Info.PCIAddress,
+			SecureErase: dwc.config.SecureErase,
 		}
 		if isVFIO {
 			pnvme.UseIOMMUFD = vfio.UseIOMMUFD
@@ -312,6 +327,51 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	return prepared, nil
 }
 
+// eraseDevicePaths resolves the block device paths to erase for an
+// allocatable device name. For a namespace device this is just that
+// namespace's path. For a controller device this is every namespace under
+// that controller — safe with respect to OTHER claims only because the
+// KEP-4815 shared counter set (GetSharedCounterSet in deviceinfo.go) ties the
+// controller device and all of its namespace devices to one capacity pool:
+// allocating the controller device consumes the entire shared counter, which
+// makes it mutually exclusive with any namespace device on that same
+// controller being allocated to a different claim. If that counter model
+// ever changes, this assumption must be revisited.
+func (s *DeviceState) eraseDevicePaths(deviceName string) ([]string, error) {
+	allocDev, exists := s.allocatable[deviceName]
+	if !exists {
+		return nil, fmt.Errorf("device %s not found in allocatable set", deviceName)
+	}
+	if allocDev.IsNamespaceDevice() {
+		return []string{allocDev.Namespace.DevicePath}, nil
+	}
+	paths := make([]string, 0, len(allocDev.Info.Namespaces))
+	for _, ns := range allocDev.Info.Namespaces {
+		paths = append(paths, ns.DevicePath)
+	}
+	return paths, nil
+}
+
+// Unprepare releases the devices for claimUID. It must be idempotent: the
+// kubelet may call it more than once for the same claim.
+//
+// The prepared-claim map entry is deleted only after all teardown work
+// (VFIO rebind, secure erase) succeeds. This ordering is required for
+// fail-closed secure erase: if erase fails and this returns an error while
+// the map entry was already gone, a kubelet retry would find nothing to
+// retry and silently "succeed" without ever erasing.
+//
+// Note: this only honors each device's persisted PreparedNvme.SecureErase —
+// it does NOT re-check s.secureEraseEnabled. This is intentional: once a
+// claim has been accepted with a promise to erase, turning the driver-level
+// flag off later must never silently cause that promise to be dropped.
+//
+// If a multi-device claim's erase loop fails partway through (e.g. device 2
+// of 3), a retry re-erases all of that claim's SecureErase devices again,
+// including ones that already succeeded. This is intentional, not a bug:
+// crypto erase is idempotent and near-instant, so redundant re-erasure is
+// cheap, and it keeps the retry logic simple (no partial-completion state to
+// track).
 func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 	logger := klog.FromContext(ctx)
 
@@ -321,14 +381,46 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 		s.mu.Unlock()
 		return nil
 	}
-	delete(s.prepared, claimUID)
+	if s.unpreparing[claimUID] {
+		s.mu.Unlock()
+		return fmt.Errorf("claim %s is already being unprepared", claimUID)
+	}
+	s.unpreparing[claimUID] = true
 	s.mu.Unlock()
+
+	succeeded := false
+	defer func() {
+		s.mu.Lock()
+		delete(s.unpreparing, claimUID)
+		if succeeded {
+			delete(s.prepared, claimUID)
+		}
+		s.mu.Unlock()
+	}()
 
 	for _, dev := range devices {
 		if dev.IsVFIO && dev.PCIAddress != "" {
 			unprepareVFIO(dev.PCIAddress)
 		}
 	}
+
+	for _, dev := range devices {
+		if !dev.SecureErase {
+			continue
+		}
+		paths, err := s.eraseDevicePaths(dev.DeviceName)
+		if err != nil {
+			return fmt.Errorf("resolving erase targets for claim %s device %s: %w", claimUID, dev.DeviceName, err)
+		}
+		// secureErase uses s.baseCtx (driver-lifetime), not ctx (this RPC's
+		// context) — see the doc comment on secureErase for why.
+		if err := secureErase(s.baseCtx, paths); err != nil {
+			return fmt.Errorf("secure erase failed for claim %s device %s: %w", claimUID, dev.DeviceName, err)
+		}
+		logger.Info("Secure erase complete", "claim", claimUID, "device", dev.DeviceName, "paths", paths)
+	}
+
+	succeeded = true
 
 	specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 	if err := s.cdiCache.RemoveSpec(specName); err != nil {
@@ -482,8 +574,14 @@ func unprepareVFIO(pciAddr string) {
 
 // Checkpoint persistence
 
+// checkpointSchemaVersion bumps whenever a checkpoint-affecting field is
+// added whose zero-value default on restore has security-relevant meaning.
+// Version 1 introduces PreparedNvme.SecureErase.
+const checkpointSchemaVersion = 1
+
 type checkpoint struct {
-	Prepared map[string][]*PreparedNvme `json:"prepared"`
+	SchemaVersion int                        `json:"schemaVersion,omitempty"`
+	Prepared      map[string][]*PreparedNvme `json:"prepared"`
 }
 
 func (s *DeviceState) saveCheckpoint() error {
@@ -494,7 +592,7 @@ func (s *DeviceState) saveCheckpoint() error {
 	}
 	s.mu.Unlock()
 
-	data, err := json.Marshal(checkpoint{Prepared: preparedCopy})
+	data, err := json.Marshal(checkpoint{SchemaVersion: checkpointSchemaVersion, Prepared: preparedCopy})
 	if err != nil {
 		return fmt.Errorf("marshal checkpoint: %w", err)
 	}
@@ -530,6 +628,11 @@ func (s *DeviceState) restoreCheckpoint(logger klog.Logger) error {
 		s.prepared = cp.Prepared
 		s.mu.Unlock()
 		logger.Info("Restored checkpoint", "claims", len(cp.Prepared))
+		if len(cp.Prepared) > 0 && cp.SchemaVersion < checkpointSchemaVersion {
+			logger.Error(nil, "Restored checkpoint predates secure-erase support; "+
+				"any restored claims will be released WITHOUT cryptographic erase even if originally "+
+				"requested — verify data disposition manually if secure erase was expected")
+		}
 	}
 	return nil
 }
