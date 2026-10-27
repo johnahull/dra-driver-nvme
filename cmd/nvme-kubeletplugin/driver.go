@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
+	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
@@ -61,7 +62,10 @@ func NewDriver(ctx context.Context, cancel context.CancelFunc, clientset kuberne
 		kubeletplugin.DriverName(DriverName),
 		kubeletplugin.RegistrarDirectoryPath(f.kubeletRegistrarDirectoryPath),
 		kubeletplugin.PluginDataDirectoryPath(f.pluginDataDirectoryPath),
-		kubeletplugin.EnableDeviceMetadata(true, []schema.GroupVersion{drametadatav1alpha1.SchemeGroupVersion}),
+		kubeletplugin.EnableDeviceMetadata(true, []schema.GroupVersion{
+			drametadatav1beta1.SchemeGroupVersion,
+			drametadatav1alpha1.SchemeGroupVersion,
+		}),
 	}
 	if podUID != "" {
 		opts = append(opts, kubeletplugin.RollingUpdate(types.UID(podUID)))

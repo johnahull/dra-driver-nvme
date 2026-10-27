@@ -90,6 +90,7 @@ spec:
       - name: cdi
         hostPath:
           path: {{ .Values.plugin.cdiRoot }}
+          type: DirectoryOrCreate
       - name: dev
         hostPath:
           path: /dev

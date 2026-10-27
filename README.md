@@ -40,6 +40,10 @@ kubectl apply -f deploy/daemonset.yaml
 kubectl apply -f deploy/deviceclass.yaml
 ```
 
+The DaemonSet uses the public `ghcr.io/johnahull/dra-driver-nvme:main`
+image published by CI. Pin the image to a `sha-*` tag before using it in
+production.
+
 This creates:
 - `dra-nvme` namespace with the driver DaemonSet
 - `dra.nvme` DeviceClass (block device mode)

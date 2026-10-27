@@ -4,8 +4,9 @@ platform: kubernetes
 
 image:
   repository: ghcr.io/johnahull/dra-driver-nvme
-  tag: latest
-  pullPolicy: IfNotPresent
+  # CI publishes the default branch as "main"; use an immutable sha-* tag for production.
+  tag: main
+  pullPolicy: Always
 
 imagePullSecrets: []
 # - name: my-registry-secret
@@ -58,7 +59,13 @@ resources: {}
 
 nodeSelector: {}
 
-tolerations: []
+tolerations:
+- key: node-role.kubernetes.io/control-plane
+  operator: Exists
+  effect: NoSchedule
+- key: node-role.kubernetes.io/master
+  operator: Exists
+  effect: NoSchedule
 
 affinity: {}
 

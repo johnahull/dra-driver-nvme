@@ -1,67 +1,3 @@
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: dra-driver-nvme
-  namespace: dra-nvme
-spec:
-  selector:
-    matchLabels:
-      app: dra-driver-nvme
-  template:
-    metadata:
-      labels:
-        app: dra-driver-nvme
-    spec:
-      serviceAccountName: dra-driver-nvme
-      containers:
-      - name: plugin
-        image: dra-driver-nvme:latest
-        imagePullPolicy: IfNotPresent
-        command:
-        - /nvme-kubeletplugin
-        args:
-        - --node-name=$(NODE_NAME)
-        - --cdi-root=/var/run/cdi
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: POD_UID
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.uid
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - name: plugins-registry
-          mountPath: /var/lib/kubelet/plugins_registry
-        - name: plugins
-          mountPath: /var/lib/kubelet/plugins/dra.nvme
-        - name: cdi
-          mountPath: /var/run/cdi
-        - name: dev
-          mountPath: /dev
-        - name: sys
-          mountPath: /sys
-      volumes:
-      - name: plugins-registry
-        hostPath:
-          path: /var/lib/kubelet/plugins_registry
-      - name: plugins
-        hostPath:
-          path: /var/lib/kubelet/plugins/dra.nvme
-          type: DirectoryOrCreate
-      - name: cdi
-        hostPath:
-          path: /var/run/cdi
-      - name: dev
-        hostPath:
-          path: /dev
-      - name: sys
-        hostPath:
-          path: /sys
----
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -97,3 +33,76 @@ subjects:
 - kind: ServiceAccount
   name: dra-driver-nvme
   namespace: dra-nvme
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-driver-nvme
+  namespace: dra-nvme
+spec:
+  selector:
+    matchLabels:
+      app: dra-driver-nvme
+  template:
+    metadata:
+      labels:
+        app: dra-driver-nvme
+    spec:
+      serviceAccountName: dra-driver-nvme
+      containers:
+      - name: plugin
+        # CI publishes the default branch as "main"; pin this to a sha-* tag for production.
+        image: ghcr.io/johnahull/dra-driver-nvme:main
+        imagePullPolicy: Always
+        command:
+        - /nvme-kubeletplugin
+        args:
+        - --node-name=$(NODE_NAME)
+        - --cdi-root=/var/run/cdi
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: plugins-registry
+          mountPath: /var/lib/kubelet/plugins_registry
+        - name: plugins
+          mountPath: /var/lib/kubelet/plugins/dra.nvme
+        - name: cdi
+          mountPath: /var/run/cdi
+        - name: dev
+          mountPath: /dev
+        - name: sys
+          mountPath: /sys
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      volumes:
+      - name: plugins-registry
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry
+      - name: plugins
+        hostPath:
+          path: /var/lib/kubelet/plugins/dra.nvme
+          type: DirectoryOrCreate
+      - name: cdi
+        hostPath:
+          path: /var/run/cdi
+          type: DirectoryOrCreate
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: sys
+        hostPath:
+          path: /sys

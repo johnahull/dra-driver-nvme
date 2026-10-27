@@ -537,13 +537,13 @@ func (s *DeviceState) restoreCheckpoint(logger klog.Logger) error {
 func getOpaqueDeviceConfigs(configs []resourceapi.DeviceAllocationConfiguration) ([]*OpaqueDeviceConfig, error) {
 	var classConfigs, claimConfigs []*OpaqueDeviceConfig
 	for _, config := range configs {
-		if config.DeviceConfiguration.Opaque == nil {
+		if config.Opaque == nil {
 			continue
 		}
-		if config.DeviceConfiguration.Opaque.Driver != DriverName {
+		if config.Opaque.Driver != DriverName {
 			continue
 		}
-		decoded, err := runtime.Decode(nvmeapi.Decoder, config.DeviceConfiguration.Opaque.Parameters.Raw)
+		decoded, err := runtime.Decode(nvmeapi.Decoder, config.Opaque.Parameters.Raw)
 		if err != nil {
 			return nil, fmt.Errorf("error decoding NvmeConfig: %w", err)
 		}
