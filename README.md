@@ -42,7 +42,8 @@ kubectl apply -f deploy/deviceclass.yaml
 
 The DaemonSet uses the public `ghcr.io/johnahull/dra-driver-nvme:main`
 image published by CI. Pin the image to a `sha-*` tag before using it in
-production.
+production. The provided manifests use scalar NUMA attributes so they work
+without the optional `DRAListTypeAttributes` feature gate.
 
 This creates:
 - `dra-nvme` namespace with the driver DaemonSet

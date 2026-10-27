@@ -42,7 +42,9 @@ deviceClass:
 plugin:
   cdiRoot: /var/run/cdi
   # Additional CLI arguments passed to the plugin binary
-  extraArgs: []
+  # Scalar NUMA attributes work without the DRAListTypeAttributes feature gate.
+  extraArgs:
+  - --numa-list=false
   # - --v=4
   # Additional environment variables
   extraEnv: []
