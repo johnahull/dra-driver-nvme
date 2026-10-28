@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,6 +47,7 @@ type DeviceState struct {
 	allocatable    AllocatableDevices // immutable after initialization
 	prepared       map[string][]*PreparedNvme
 	preparing      map[string]bool
+	unpreparing    map[string]bool
 	cdiCache       *cdiapi.Cache
 	checkpointPath string
 }
@@ -87,6 +89,7 @@ func NewDeviceState(ctx context.Context, f *flags) (*DeviceState, error) {
 		allocatable:    allocatable,
 		prepared:       make(map[string][]*PreparedNvme),
 		preparing:      make(map[string]bool),
+		unpreparing:    make(map[string]bool),
 		cdiCache:       cache,
 		checkpointPath: checkpointPath,
 	}
@@ -196,20 +199,20 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		isVFIO := dwc.config.Mode == "vfio"
 
 		if allocDev.IsNamespaceDevice() && isVFIO {
-			for _, addr := range vfioBound {
-				unprepareVFIO(addr)
-			}
-			return nil, fmt.Errorf("namespace device %s cannot use VFIO mode (use mode=block)", result.Device)
+			return nil, errors.Join(
+				fmt.Errorf("namespace device %s cannot use VFIO mode (use mode=block)", result.Device),
+				unprepareVFIOs(vfioBound),
+			)
 		}
 
 		if isVFIO {
 			var err error
 			vfio, err = prepareVFIO(allocDev.Info.PCIAddress, dwc.config.Force)
 			if err != nil {
-				for _, addr := range vfioBound {
-					unprepareVFIO(addr)
-				}
-				return nil, fmt.Errorf("VFIO prepare failed for %s: %w", result.Device, err)
+				return nil, errors.Join(
+					fmt.Errorf("VFIO prepare failed for %s: %w", result.Device, err),
+					unprepareVFIOs(vfioBound),
+				)
 			}
 			vfioBound = append(vfioBound, allocDev.Info.PCIAddress)
 
@@ -286,18 +289,18 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		}
 		minVersion, err := cdiapi.MinimumRequiredVersion(spec)
 		if err != nil {
-			for _, addr := range vfioBound {
-				unprepareVFIO(addr)
-			}
-			return nil, fmt.Errorf("failed to get CDI spec version: %w", err)
+			return nil, errors.Join(
+				fmt.Errorf("failed to get CDI spec version: %w", err),
+				unprepareVFIOs(vfioBound),
+			)
 		}
 		spec.Version = minVersion
 
 		if err := s.cdiCache.WriteSpec(spec, specName); err != nil {
-			for _, addr := range vfioBound {
-				unprepareVFIO(addr)
-			}
-			return nil, fmt.Errorf("failed to write CDI spec: %w", err)
+			return nil, errors.Join(
+				fmt.Errorf("failed to write CDI spec: %w", err),
+				unprepareVFIOs(vfioBound),
+			)
 		}
 	}
 
@@ -316,19 +319,51 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
 	logger := klog.FromContext(ctx)
 
 	s.mu.Lock()
+	if s.unpreparing[claimUID] {
+		s.mu.Unlock()
+		return fmt.Errorf("claim %s is already being unprepared", claimUID)
+	}
 	devices, ok := s.prepared[claimUID]
 	if !ok {
 		s.mu.Unlock()
 		return nil
 	}
-	delete(s.prepared, claimUID)
+	if s.unpreparing == nil {
+		s.unpreparing = make(map[string]bool)
+	}
+	s.unpreparing[claimUID] = true
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.unpreparing, claimUID)
+		s.mu.Unlock()
+	}()
 
+	var cleanupErrs []error
+	var remaining []*PreparedNvme
 	for _, dev := range devices {
 		if dev.IsVFIO && dev.PCIAddress != "" {
-			unprepareVFIO(dev.PCIAddress)
+			if err := unprepareVFIO(dev.PCIAddress); err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to unprepare VFIO device %s: %w", dev.PCIAddress, err))
+				remaining = append(remaining, dev)
+			}
 		}
 	}
+	if err := errors.Join(cleanupErrs...); err != nil {
+		s.mu.Lock()
+		s.prepared[claimUID] = remaining
+		s.mu.Unlock()
+		if s.checkpointPath != "" {
+			if checkpointErr := s.saveCheckpoint(); checkpointErr != nil {
+				return errors.Join(err, fmt.Errorf("failed to save checkpoint after VFIO cleanup failure: %w", checkpointErr))
+			}
+		}
+		return err
+	}
+
+	s.mu.Lock()
+	delete(s.prepared, claimUID)
+	s.mu.Unlock()
 
 	specName := cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)
 	if err := s.cdiCache.RemoveSpec(specName); err != nil {
@@ -430,23 +465,22 @@ func prepareVFIO(pciAddr string, force bool) (*vfioResult, error) {
 
 	overridePath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)
 	if err := sysfs.WriteFile(overridePath, []byte("vfio-pci"), 0644); err != nil {
-		return nil, fmt.Errorf("failed to set driver_override: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("failed to set driver_override: %w", err),
+			restoreNvme(pciAddr),
+		)
 	}
 
 	bindPath := "/sys/bus/pci/drivers/vfio-pci/bind"
 	if err := sysfs.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
-		if clearErr := sysfs.WriteFile(overridePath, []byte(""), 0644); clearErr != nil {
-			klog.ErrorS(clearErr, "Failed to clear driver_override after bind failure", "pciAddr", pciAddr)
-		}
-		nvmeBindPath := "/sys/bus/pci/drivers/nvme/bind"
-		if rebindErr := sysfs.WriteFile(nvmeBindPath, []byte(pciAddr), 0644); rebindErr != nil {
-			klog.V(2).InfoS("Failed to restore nvme driver after bind failure", "pciAddr", pciAddr, "err", rebindErr)
-		}
-		return nil, fmt.Errorf("failed to bind to vfio-pci: %w", err)
+		return nil, errors.Join(fmt.Errorf("failed to bind to vfio-pci: %w", err), restoreNvme(pciAddr))
 	}
 
-	if err := sysfs.WriteFile(overridePath, []byte(""), 0644); err != nil {
-		klog.V(2).InfoS("Failed to clear driver_override", "pciAddr", pciAddr, "err", err)
+	if err := clearDriverOverride(pciAddr); err != nil {
+		if rollbackErr := unprepareVFIO(pciAddr); rollbackErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("failed to roll back VFIO binding: %w", rollbackErr))
+		}
+		return nil, err
 	}
 
 	result := &vfioResult{IOMMUGroup: groupID}
@@ -465,19 +499,58 @@ func prepareVFIO(pciAddr string, force bool) (*vfioResult, error) {
 	return result, nil
 }
 
-func unprepareVFIO(pciAddr string) {
-	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
-	if err := sysfs.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
-		klog.V(2).InfoS("Failed to unbind from vfio-pci", "pciAddr", pciAddr, "err", err)
-	}
-
+func clearDriverOverride(pciAddr string) error {
 	overridePath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)
-	_ = sysfs.WriteFile(overridePath, []byte(""), 0644)
+	if err := sysfs.WriteFile(overridePath, []byte("\n"), 0644); err != nil {
+		return fmt.Errorf("failed to clear driver_override for %s: %w", pciAddr, err)
+	}
+	return nil
+}
+
+func restoreNvme(pciAddr string) error {
+	var cleanupErrs []error
+	if err := clearDriverOverride(pciAddr); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+	}
 
 	bindPath := "/sys/bus/pci/drivers/nvme/bind"
 	if err := sysfs.WriteFile(bindPath, []byte(pciAddr), 0644); err != nil {
-		klog.V(2).InfoS("Failed to rebind to nvme", "pciAddr", pciAddr, "err", err)
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to rebind to nvme: %w", err))
+	} else {
+		driverPath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)
+		target, err := sysfs.ReadLink(driverPath)
+		if err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to verify nvme rebind for %s: %w", pciAddr, err))
+		} else if driver := filepath.Base(target); driver != "nvme" {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to verify nvme rebind for %s: bound to %s", pciAddr, driver))
+		}
 	}
+	return errors.Join(cleanupErrs...)
+}
+
+func unprepareVFIO(pciAddr string) error {
+	var cleanupErrs []error
+
+	unbindPath := "/sys/bus/pci/drivers/vfio-pci/unbind"
+	if err := sysfs.WriteFile(unbindPath, []byte(pciAddr), 0644); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to unbind from vfio-pci: %w", err))
+	}
+
+	if err := restoreNvme(pciAddr); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+	}
+
+	return errors.Join(cleanupErrs...)
+}
+
+func unprepareVFIOs(pciAddrs []string) error {
+	var cleanupErrs []error
+	for _, pciAddr := range pciAddrs {
+		if err := unprepareVFIO(pciAddr); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to roll back VFIO device %s: %w", pciAddr, err))
+		}
+	}
+	return errors.Join(cleanupErrs...)
 }
 
 // Checkpoint persistence

@@ -15,13 +15,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 )
 
 type writeCall struct {
@@ -36,6 +41,7 @@ type mockSysfsOps struct {
 	dirErrs   map[string]error
 	stats     map[string]bool
 	writeErrs map[string]error
+	writeErr  func(path, data string) error
 	writes    []writeCall
 	files     map[string][]byte
 	fileErrs  map[string]error
@@ -66,6 +72,11 @@ func (m *mockSysfsOps) ReadLink(path string) (string, error) {
 
 func (m *mockSysfsOps) WriteFile(path string, data []byte, _ fs.FileMode) error {
 	m.writes = append(m.writes, writeCall{Path: path, Data: string(data)})
+	if m.writeErr != nil {
+		if err := m.writeErr(path, string(data)); err != nil {
+			return err
+		}
+	}
 	if err, ok := m.writeErrs[path]; ok {
 		return err
 	}
@@ -357,6 +368,39 @@ func setupHappyPathMock(m *mockSysfsOps, pciAddr string) {
 	m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
 }
 
+func TestClearDriverOverride(t *testing.T) {
+	const pciAddr = "0000:3b:00.0"
+	m := newMockSysfs()
+	withMockSysfs(t, m)
+
+	if err := clearDriverOverride(pciAddr); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := writeCall{
+		Path: fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr),
+		Data: "\n",
+	}
+	if len(m.writes) != 1 || m.writes[0] != want {
+		t.Fatalf("writes = %v, want [%v]", m.writes, want)
+	}
+}
+
+func TestRestoreNvmeVerifiesDriver(t *testing.T) {
+	const pciAddr = "0000:3b:00.0"
+	m := newMockSysfs()
+	m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/vfio-pci"
+	withMockSysfs(t, m)
+
+	err := restoreNvme(pciAddr)
+	if err == nil {
+		t.Fatal("expected driver verification error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to verify nvme rebind") {
+		t.Errorf("error %q does not contain driver verification message", err)
+	}
+}
+
 func TestPrepareVFIO(t *testing.T) {
 	const pciAddr = "0000:3b:00.0"
 
@@ -383,7 +427,7 @@ func TestPrepareVFIO(t *testing.T) {
 					{"/sys/bus/pci/drivers/nvme/unbind", pciAddr},
 					{fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr), "vfio-pci"},
 					{"/sys/bus/pci/drivers/vfio-pci/bind", pciAddr},
-					{fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr), ""},
+					{fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr), "\n"},
 				}
 				if len(writes) != len(expected) {
 					t.Fatalf("got %d writes, want %d:\n  got:  %v\n  want: %v", len(writes), len(expected), writes, expected)
@@ -445,6 +489,36 @@ func TestPrepareVFIO(t *testing.T) {
 						t.Errorf("write[%d] path = %q, want %q", i, p, wantPaths[i])
 					}
 				}
+				if writes[3].Data != "\n" {
+					t.Errorf("rollback should clear driver_override with newline, got %q", writes[3].Data)
+				}
+			},
+		},
+		{
+			name:    "driver_override clear fails: verify rollback",
+			pciAddr: pciAddr,
+			setup: func(m *mockSysfsOps) {
+				setupHappyPathMock(m, pciAddr)
+				m.writeErr = func(path, data string) error {
+					if path == fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr) && data == "\n" {
+						return fmt.Errorf("read-only fs")
+					}
+					return nil
+				}
+			},
+			wantErr:    true,
+			wantErrMsg: "failed to clear driver_override",
+			checkWrites: func(t *testing.T, writes []writeCall) {
+				t.Helper()
+				if len(writes) != 7 {
+					t.Fatalf("got %d writes, want 7: %v", len(writes), writes)
+				}
+				if writes[3].Data != "\n" || writes[5].Data != "\n" {
+					t.Errorf("rollback clear writes = %q and %q, want newline", writes[3].Data, writes[5].Data)
+				}
+				if writes[6].Path != "/sys/bus/pci/drivers/nvme/bind" {
+					t.Errorf("last write path = %q, want nvme bind", writes[6].Path)
+				}
 			},
 		},
 		{
@@ -456,6 +530,26 @@ func TestPrepareVFIO(t *testing.T) {
 			},
 			wantErr:    true,
 			wantErrMsg: "failed to set driver_override",
+			checkWrites: func(t *testing.T, writes []writeCall) {
+				t.Helper()
+				wantPaths := []string{
+					"/sys/bus/pci/drivers/nvme/unbind",
+					fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr),
+					fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr),
+					"/sys/bus/pci/drivers/nvme/bind",
+				}
+				if len(writes) != len(wantPaths) {
+					t.Fatalf("writes = %v, want %v", writes, wantPaths)
+				}
+				for i, wantPath := range wantPaths {
+					if writes[i].Path != wantPath {
+						t.Errorf("write[%d] path = %q, want %q", i, writes[i].Path, wantPath)
+					}
+				}
+				if writes[2].Data != "\n" {
+					t.Errorf("rollback should clear driver_override with newline, got %q", writes[2].Data)
+				}
+			},
 		},
 		{
 			name:    "co-grouped device blocks binding",
@@ -626,11 +720,14 @@ func TestUnprepareVFIO(t *testing.T) {
 	tests := []struct {
 		name        string
 		setup       func(*mockSysfsOps)
+		wantErrMsg  string
 		checkWrites func(t *testing.T, writes []writeCall)
 	}{
 		{
-			name:  "successful unbind and rebind",
-			setup: func(_ *mockSysfsOps) {},
+			name: "successful unbind and rebind",
+			setup: func(m *mockSysfsOps) {
+				m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
+			},
 			checkWrites: func(t *testing.T, writes []writeCall) {
 				t.Helper()
 				if len(writes) != 3 {
@@ -639,7 +736,7 @@ func TestUnprepareVFIO(t *testing.T) {
 				if writes[0].Path != "/sys/bus/pci/drivers/vfio-pci/unbind" {
 					t.Errorf("write[0] = %q, want unbind path", writes[0].Path)
 				}
-				if writes[1].Data != "" {
+				if writes[1].Data != "\n" {
 					t.Errorf("write[1] should clear driver_override, got %q", writes[1].Data)
 				}
 				if writes[2].Path != "/sys/bus/pci/drivers/nvme/bind" {
@@ -650,8 +747,10 @@ func TestUnprepareVFIO(t *testing.T) {
 		{
 			name: "unbind fails: still clears override and tries rebind",
 			setup: func(m *mockSysfsOps) {
+				m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
 				m.writeErrs["/sys/bus/pci/drivers/vfio-pci/unbind"] = fmt.Errorf("device busy")
 			},
+			wantErrMsg: "failed to unbind from vfio-pci",
 			checkWrites: func(t *testing.T, writes []writeCall) {
 				t.Helper()
 				if len(writes) != 3 {
@@ -660,10 +759,29 @@ func TestUnprepareVFIO(t *testing.T) {
 			},
 		},
 		{
-			name: "nvme rebind fails: best-effort",
+			name: "driver_override clear fails",
 			setup: func(m *mockSysfsOps) {
+				m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
+				m.writeErrs[fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)] = fmt.Errorf("read-only fs")
+			},
+			wantErrMsg: "failed to clear driver_override",
+			checkWrites: func(t *testing.T, writes []writeCall) {
+				t.Helper()
+				if len(writes) != 3 {
+					t.Fatalf("got %d writes, want 3: %v", len(writes), writes)
+				}
+				if writes[1].Data != "\n" {
+					t.Errorf("clear write = %q, want newline", writes[1].Data)
+				}
+			},
+		},
+		{
+			name: "nvme rebind fails",
+			setup: func(m *mockSysfsOps) {
+				m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
 				m.writeErrs["/sys/bus/pci/drivers/nvme/bind"] = fmt.Errorf("no such device")
 			},
+			wantErrMsg: "failed to rebind to nvme",
 			checkWrites: func(t *testing.T, writes []writeCall) {
 				t.Helper()
 				if len(writes) != 3 {
@@ -679,12 +797,109 @@ func TestUnprepareVFIO(t *testing.T) {
 			tt.setup(m)
 			withMockSysfs(t, m)
 
-			unprepareVFIO(pciAddr)
+			err := unprepareVFIO(pciAddr)
+			if tt.wantErrMsg == "" && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantErrMsg != "" {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.wantErrMsg) {
+					t.Errorf("error %q does not contain %q", err, tt.wantErrMsg)
+				}
+			}
 
 			if tt.checkWrites != nil {
 				tt.checkWrites(t, m.writes)
 			}
 		})
+	}
+}
+
+func TestUnprepareResourceClaimsReportsVFIOCleanupError(t *testing.T) {
+	const (
+		claimUID = "claim-uid"
+		pciAddr  = "0000:3b:00.0"
+	)
+	m := newMockSysfs()
+	m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
+	m.writeErrs[fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", pciAddr)] = fmt.Errorf("read-only fs")
+	withMockSysfs(t, m)
+
+	s := &DeviceState{
+		prepared: map[string][]*PreparedNvme{
+			claimUID: {{IsVFIO: true, PCIAddress: pciAddr}},
+		},
+	}
+	d := &driver{state: s}
+	result, err := d.UnprepareResourceClaims(context.Background(), []kubeletplugin.NamespacedObject{
+		{UID: types.UID(claimUID)},
+	})
+	if err != nil {
+		t.Fatalf("unexpected top-level error: %v", err)
+	}
+	if err := result[types.UID(claimUID)]; err == nil {
+		t.Fatal("expected per-claim cleanup error, got nil")
+	} else if !strings.Contains(err.Error(), "failed to clear driver_override") {
+		t.Errorf("error %q does not contain failed clear message", err)
+	}
+}
+
+func TestUnprepareSavesPartialCleanupCheckpoint(t *testing.T) {
+	const claimUID = "claim-uid"
+	const firstPCI = "0000:3b:00.0"
+	const secondPCI = "0000:3b:00.1"
+
+	m := newMockSysfs()
+	for _, pciAddr := range []string{firstPCI, secondPCI} {
+		m.links[fmt.Sprintf("/sys/bus/pci/devices/%s/driver", pciAddr)] = "../../../../bus/pci/drivers/nvme"
+	}
+	m.writeErrs[fmt.Sprintf("/sys/bus/pci/devices/%s/driver_override", secondPCI)] = fmt.Errorf("read-only fs")
+	withMockSysfs(t, m)
+
+	s := &DeviceState{
+		prepared: map[string][]*PreparedNvme{
+			claimUID: {
+				{IsVFIO: true, PCIAddress: firstPCI},
+				{IsVFIO: true, PCIAddress: secondPCI},
+			},
+		},
+		checkpointPath: filepath.Join(t.TempDir(), "prepared-claims.json"),
+	}
+	if err := s.Unprepare(context.Background(), claimUID); err == nil {
+		t.Fatal("expected cleanup error, got nil")
+	}
+
+	data, err := os.ReadFile(s.checkpointPath)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	var cp checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		t.Fatalf("unmarshal checkpoint: %v", err)
+	}
+	remaining := cp.Prepared[claimUID]
+	if len(remaining) != 1 || remaining[0].PCIAddress != secondPCI {
+		t.Fatalf("checkpoint remaining devices = %#v, want only %s", remaining, secondPCI)
+	}
+}
+
+func TestUnprepareRejectsConcurrentCleanup(t *testing.T) {
+	const claimUID = "claim-uid"
+	s := &DeviceState{
+		prepared: map[string][]*PreparedNvme{
+			claimUID: {{IsVFIO: true, PCIAddress: "0000:3b:00.0"}},
+		},
+		unpreparing: map[string]bool{claimUID: true},
+	}
+
+	err := s.Unprepare(context.Background(), claimUID)
+	if err == nil {
+		t.Fatal("expected concurrent cleanup error, got nil")
+	}
+	if !strings.Contains(err.Error(), "already being unprepared") {
+		t.Errorf("error %q does not contain concurrent cleanup message", err)
 	}
 }
 
